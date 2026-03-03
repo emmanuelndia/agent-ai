@@ -34,6 +34,10 @@ export const config = {
   },
 };
 
+app.get('/', (req, res) => {
+  res.send('<h1>🚀 Agent AI Backend est en ligne !</h1><p>Le serveur fonctionne et attend les requêtes du frontend.</p>');
+});
+
 
 // Health check
 app.get('/health', (req: Request, res: Response) => {
