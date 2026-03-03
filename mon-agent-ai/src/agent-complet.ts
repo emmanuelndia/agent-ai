@@ -77,7 +77,7 @@ const TOUS_LES_TOOLS = [...outilsDeBase, ...browserTools, ...e2bTools, ...creden
 
 const llm = new ChatGoogleGenerativeAI({
 
-    model: "gemini-2.5-flash", // Modèle correct
+    model: "gemini-3-flash-preview", // Ou ChatGroq llama-3.1-70b GROQ_API_KEY ou ChatGoogleGenerativeAI gemini-2.5-flash gemini-3-flash-preview GOOGLE_API_KEY
     cache: new InMemoryCache(),
 
     temperature: 0, // 0 = plus précis, 1 = plus créatif
@@ -121,7 +121,7 @@ const EtatAgent = Annotation.Root({
 
         reducer: (ancien, nouveau) => [...ancien, ...nouveau],
 
-        default: () => [],
+        default: () => [],  
 
     }),
 
@@ -133,6 +133,8 @@ const EtatAgent = Annotation.Root({
 
 async function noeudLLM(etat: typeof EtatAgent.State) {
 
+    await new Promise(resolve => setTimeout(resolve, 3000));
+    
     // Utiliser le gestionnaire de contexte avancé
 
     const optimizedContext = await contextManager.getOptimizedContext(SYSTEME_PROMPT);

@@ -252,25 +252,33 @@ export const attendre = tool(
 
 // TOOL : REMPLIR UN FORMULAIRE
 export const remplir_formulaire = tool(
-  async ({ champs }) => {
+  async ({ donnees_formulaire }) => {
     try {
       const page = navigateur.getPage();
-      for (const [selecteur, valeur] of Object.entries(champs)) {
-        await page.fill(selecteur, valeur as string);
+      // On s'attend à recevoir une chaîne JSON ou un format simple
+      const champs = typeof donnees_formulaire === 'string' 
+        ? JSON.parse(donnees_formulaire) 
+        : donnees_formulaire;
+
+      for (const [selector, value] of Object.entries(champs)) {
+        await page.waitForSelector(selector, { state: 'visible', timeout: 5000 });
+        await page.fill(selector, value as string);
       }
       return "Formulaire rempli avec succès.";
     } catch (e) {
-      return `Erreur lors du remplissage : ${(e as Error).message}`;
+      return `Erreur : ${(e as Error).message}`;
     }
   },
   {
     name: "remplir_formulaire",
-    description: "Remplit plusieurs champs d'un formulaire en une seule fois.",
+    description: "Remplit plusieurs champs. Format attendu: un objet JSON simple {'sélecteur': 'valeur'}.",
     schema: z.object({
-      champs: z.record(z.string(), z.string()).describe("Objet clé-valeur (sélecteur: valeur)")
+      // On évite z.record() qui génère "propertyNames"
+      donnees_formulaire: z.string().describe("Objet JSON des champs à remplir (ex: '{\"#email\": \"test@test.com\"}')")
     }),
   }
 );
+
 
 // TOOL : COCHER UNE CASE 
 export const cocherCase = tool(
