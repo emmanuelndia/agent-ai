@@ -7,7 +7,18 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT || 3001;
+const PORT = Number(process.env.PORT) || 3000;
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Serveur démarré sur le port ${PORT}`);
+});
+
+export const config = {
+  api: {
+    bodyParser: {
+      sizeLimit: '10mb',
+    },
+  },
+};
 
 // Middleware
 app.use(cors());
@@ -86,7 +97,7 @@ app.post('/api/chat', async (req: Request, res: Response) => {
   }
 });
 
-// Démarrer le serveur
+/* // Démarrer le serveur
 app.listen(PORT, () => {
   console.log(`\n🚀 Agent AI Backend Server is running on port ${PORT}`);
   console.log(`📡 Health check: http://localhost:${PORT}/health`);
@@ -94,6 +105,6 @@ app.listen(PORT, () => {
   console.log(`📊 Context stats: http://localhost:${PORT}/api/context/stats`);
   console.log(`🧹 Clear context: POST http://localhost:${PORT}/api/context/clear`);
   console.log(`🔧 CORS enabled for frontend communication\n`);
-});
+}); */
 
 export default app;
