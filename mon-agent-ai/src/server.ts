@@ -22,8 +22,8 @@ export const config = {
 
 // Middleware
 app.use(cors({
-  origin: 'https://agent-ai-brown-chi.vercel.app', // Ton URL Vercel
-  methods: ['GET', 'POST'],
+  origin: '*', // Pour le test, mets '*' pour tout autoriser. Si ça marche, on restreindra après.
+  methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 app.use(express.json());
