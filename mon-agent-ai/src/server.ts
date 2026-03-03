@@ -7,14 +7,25 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 const app = express();
-const PORT = Number(process.env.PORT) || 3000;
+const PORT = process.env.PORT || 3000;
 
-// Ne démarrer le serveur que si ce fichier est exécuté directement
-if (require.main === module) {
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Serveur démarré sur le port ${PORT}`);
-  });
-}
+// 1. On active le middleware de base immédiatement
+app.use(cors());
+app.use(express.json());
+
+// 2. ROUTE HEALTHCHECK PRIORITAIRE (Tout en haut)
+app.get('/health', (req, res) => {
+  res.status(200).send('OK');
+});
+
+// 3. ON DÉMARRE L'ÉCOUTE MAINTENANT
+const server = app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Serveur Express démarré sur le port ${PORT}`);
+});
+
+// 4. ON IMPORTE LE RESTE APRÈS (Lazy Loading)
+// On déplace les imports lourds ici ou on s'assure qu'ils ne bloquent pas
+import { traiterMessage, contextManager } from './agent-complet';
 
 export const config = {
   api: {
@@ -24,13 +35,6 @@ export const config = {
   },
 };
 
-// Middleware
-app.use(cors({
-  origin: '*', // Pour le test, mets '*' pour tout autoriser. Si ça marche, on restreindra après.
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
-}));
-app.use(express.json());
 
 // Health check
 app.get('/health', (req: Request, res: Response) => {
