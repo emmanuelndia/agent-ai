@@ -1,23 +1,28 @@
-# Utiliser l'image officielle de Playwright qui contient déjà Node et les navigateurs
+# 1. Utiliser l'image Playwright
 FROM mcr.microsoft.com/playwright:v1.49.0-jammy
 
-# Dossier de travail
+# 2. Dossier de travail
 WORKDIR /app
 
-# Copier les fichiers de dépendances
+# 3. Copier les fichiers de dépendances
 COPY package*.json ./
 
-# Installer les dépendances
+# 4. Installer les dépendances (y compris typescript pour le build)
 RUN npm install
 
-# Copier le reste du code
+# 5. Copier tout le code source
 COPY . .
 
-# Installer les navigateurs Playwright explicitement (au cas où)
+# 6. COMPILER le TypeScript en JavaScript (Crucial !)
+# Cela va créer un dossier /dist avec des fichiers .js
+RUN npx tsc
+
+# 7. Installer Chromium pour Playwright
 RUN npx playwright install chromium
 
-# Exposer le port (Render/Railway utiliseront la variable PORT)
+# 8. Exposer le port
 EXPOSE 3000
 
-# Lancer le serveur avec ts-node (comme dans ton script dev/server)
-CMD ["npx", "ts-node", "src/server.ts"]
+# 9. LANCER la version compilée (Node JS pur, pas de ts-node)
+# On utilise le script "start" de ton package.json
+CMD ["npm", "start"]

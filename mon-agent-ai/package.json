@@ -4,19 +4,9 @@
   "description": "Agent IA autonome avec navigation web, gestion de fichiers et création de comptes automatiques",
   "main": "index.js",
   "scripts": {
-    "dev": "ts-node src/index.ts",
-    "agent": "ts-node src/agent-complet.ts",
-    "server": "ts-node src/server.ts",
-    "test:llm": "ts-node src/tests/test-llm.ts",
-    "test:tools": "ts-node src/tests/test-tools.ts",
-    "test:browser": "ts-node src/tests/test-browser.ts",
-    "test:browser-use": "ts-node src/tests/test-browser-use.ts",
-    "test:context": "ts-node src/tests/test-context-engineering.ts",
-    "llm:google": "node scripts/switch-llm.js switch google",
-    "llm:groq": "node scripts/switch-llm.js switch groq",
-    "llm:status": "node scripts/switch-llm.js status",
-    "start": "npm run agent",
-    "setup": "npm install && echo 'Configurez votre fichier .env avec .env.example'"
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "ts-node src/index.ts"
   },
   "keywords": [],
   "author": "",
