@@ -4,7 +4,8 @@
   "description": "Agent IA autonome avec navigation web, gestion de fichiers et création de comptes automatiques",
   "main": "index.js",
   "scripts": {
-    "build": "npx esbuild src/server.ts --bundle --platform=node --target=node20 --outfile=dist/server.js --external:playwright --external:express",
+    "build": "npx esbuild src/server.ts --bundle --platform=node --target=node20 --outfile=dist/server.js --format=cjs --external:@e2b/code-interpreter --external:@google/generative-ai --external:@langchain/* --external:playwright --external:express --external:cors --external:dotenv",
+    "build:simple": "npx esbuild src/server.ts --platform=node --target=node20 --outfile=dist/server.js --bundle=false",
     "start": "node dist/server.js",
     "dev": "ts-node src/index.ts"
   },
@@ -15,7 +16,8 @@
   "devDependencies": {
     "@types/node": "^25.3.2",
     "ts-node": "^10.9.2",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "esbuild": "^0.24.0"
   },
   "dependencies": {
     "@e2b/code-interpreter": "^2.3.3",

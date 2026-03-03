@@ -77,7 +77,7 @@ const TOUS_LES_TOOLS = [...outilsDeBase, ...browserTools, ...e2bTools, ...creden
 
 const llm = new ChatGoogleGenerativeAI({
 
-    model: "gemini-3-flash-preview", // Ou ChatGroq llama-3.1-70b GROQ_API_KEY ou ChatGoogleGenerativeAI gemini-2.5-flash gemini-3-flash-preview GOOGLE_API_KEY
+    model: "gemini-2-flash", // Ou ChatGroq llama-3.1-70b GROQ_API_KEY ou ChatGoogleGenerativeAI gemini-2.5-flash gemini-3-flash-preview GOOGLE_API_KEY
     cache: new InMemoryCache(),
 
     temperature: 0, // 0 = plus précis, 1 = plus créatif
@@ -401,4 +401,9 @@ async function demarrerInterface() {
 
 // Lancer l'agent
 
-demarrerInterface().catch(console.error);
+// On ne lance l'interface console QUE si on exécute ce fichier directement
+// (ex: npx ts-node src/agent-complet.ts)
+// Si c'est server.ts qui l'importe, cette partie sera ignorée.
+if (require.main === module) {
+    demarrerInterface().catch(console.error);
+}

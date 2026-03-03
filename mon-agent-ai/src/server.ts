@@ -8,9 +8,13 @@ dotenv.config();
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Serveur démarré sur le port ${PORT}`);
-});
+
+// Ne démarrer le serveur que si ce fichier est exécuté directement
+if (require.main === module) {
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Serveur démarré sur le port ${PORT}`);
+  });
+}
 
 export const config = {
   api: {

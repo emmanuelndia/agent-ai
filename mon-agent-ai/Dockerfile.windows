@@ -1,0 +1,23 @@
+FROM mcr.microsoft.com/playwright:v1.49.0-jammy
+
+WORKDIR /app
+
+# Copier les fichiers de dépendances
+COPY package*.json ./
+
+# Installer TOUTES les dépendances (nécessaire pour le build)
+RUN npm install --include=dev
+
+# Copier le reste du code
+COPY . .
+
+# Créer le dossier dist et compiler (commande Linux dans Docker)
+RUN mkdir -p dist && npx esbuild src/server.ts --bundle --platform=node --target=node20 --outfile=dist/server.js --external:@e2b/code-interpreter --external:@google/generative-ai --external:@langchain/* --external:playwright --external:express --external:cors --external:dotenv --main-fields=main,module
+
+# Installer les navigateurs Playwright
+RUN npx playwright install chromium
+
+EXPOSE 3000
+
+# Lancer le serveur compilé
+CMD ["node", "dist/server.js"]

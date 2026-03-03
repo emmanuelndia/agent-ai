@@ -1,0 +1,23 @@
+FROM mcr.microsoft.com/playwright:v1.49.0-jammy
+
+WORKDIR /app
+
+# Copier les fichiers de dépendances
+COPY package*.json ./
+
+# Installer TOUTES les dépendances (nécessaire pour le build)
+RUN npm install --include=dev
+
+# Copier le reste du code
+COPY . .
+
+# Rendre le script exécutable et l'exécuter
+RUN chmod +x build-docker.sh && ./build-docker.sh
+
+# Installer les navigateurs Playwright
+RUN npx playwright install chromium
+
+EXPOSE 3000
+
+# Lancer le serveur compilé
+CMD ["node", "dist/server.js"]
