@@ -399,11 +399,23 @@ async function demarrerInterface() {
 
 
 
+// --- SECTION DE DÉMARRAGE ---
+
+// On définit une fonction pour lancer la console
+/* async function executerModeConsole() {
+  try {
+    await demarrerInterface();
+  } catch (error) {
+    console.error("Erreur interface console:", error);
+  }
+} */
+
+
 // Lancer l'agent
 
 // On ne lance l'interface console QUE si on exécute ce fichier directement
 // (ex: npx ts-node src/agent-complet.ts)
 // Si c'est server.ts qui l'importe, cette partie sera ignorée.
-if (require.main === module) {
-    demarrerInterface().catch(console.error);
-}
+/* if (require.main === module) {
+    executerModeConsole();
+} */

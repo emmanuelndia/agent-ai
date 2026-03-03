@@ -7,7 +7,8 @@
     "build": "npx esbuild src/server.ts --bundle --platform=node --target=node20 --outfile=dist/server.js --format=cjs --external:@e2b/code-interpreter --external:@google/generative-ai --external:@langchain/* --external:playwright --external:express --external:cors --external:dotenv",
     "build:simple": "npx esbuild src/server.ts --platform=node --target=node20 --outfile=dist/server.js --bundle=false",
     "start": "node dist/server.js",
-    "dev": "ts-node src/index.ts"
+    "dev": "ts-node src/index.ts",
+    "console": "ts-node src/cli.ts"
   },
   "keywords": [],
   "author": "",
