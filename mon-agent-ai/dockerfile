@@ -15,7 +15,7 @@ COPY . .
 
 # 6. COMPILER le TypeScript en JavaScript (Crucial !)
 # Cela va créer un dossier /dist avec des fichiers .js
-RUN npx tsc
+RUN NODE_OPTIONS='--max-old-space-size=4096' npx tsc
 
 # 7. Installer Chromium pour Playwright
 RUN npx playwright install chromium
