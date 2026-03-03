@@ -1,28 +1,26 @@
-# 1. Utiliser l'image Playwright
 FROM mcr.microsoft.com/playwright:v1.49.0-jammy
 
-# 2. Dossier de travail
 WORKDIR /app
 
-# 3. Copier les fichiers de dépendances
+# Copier les fichiers de dépendances
 COPY package*.json ./
 
-
-# Installer les dépendances
+# Installer TOUTES les dépendances (nécessaire pour le build)
 RUN npm install
 
-# Copier le code
+# Copier le reste du code
 COPY . .
 
-# Lancer le build avec la limite de RAM ajustée
-RUN NODE_OPTIONS='--max-old-space-size=450' npx tsc
+# Compiler avec esbuild (très rapide, peu de RAM)
+RUN npm run build
 
-# 7. Installer Chromium pour Playwright
+# On nettoie les dépendances de développement pour gagner de la place (optionnel)
+# RUN npm prune --production
+
+# Installer les navigateurs Playwright
 RUN npx playwright install chromium
 
-# 8. Exposer le port
 EXPOSE 3000
 
-# 9. LANCER la version compilée (Node JS pur, pas de ts-node)
-# On utilise le script "start" de ton package.json
-CMD ["npm", "start"]
+# Lancer le serveur compilé
+CMD ["node", "dist/server.js"]

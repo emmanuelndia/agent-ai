@@ -4,8 +4,7 @@
   "description": "Agent IA autonome avec navigation web, gestion de fichiers et création de comptes automatiques",
   "main": "index.js",
   "scripts": {
-    "build": "NODE_OPTIONS='--max-old-space-size=450' tsc",
-    "build:dev": "tsc",
+    "build": "esbuild src/server.ts --bundle --platform=node --target=node20 --outfile=dist/server.js --external:playwright --external:express",
     "start": "node dist/server.js",
     "dev": "ts-node src/index.ts"
   },
