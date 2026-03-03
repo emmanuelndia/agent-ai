@@ -24,7 +24,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
 
 // 4. ON IMPORTE LE RESTE APRÈS (Lazy Loading)
 // On déplace les imports lourds ici ou on s'assure qu'ils ne bloquent pas
-import { traiterMessage, contextManager } from './agent-complet';
+const { traiterMessage, contextManager } = require('./agent-complet');
 
 export const config = {
   api: {
