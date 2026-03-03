@@ -44,7 +44,7 @@ export class AdvancedContextManager {
       this.llm = llmInstance;
     } else if (process.env.GOOGLE_API_KEY) {
       this.llm = new ChatGoogleGenerativeAI({
-        model: "gemini-2.5-flash", // Modèle actuel pour les résumés
+        model: "gemini-1.5-flash", // Modèle actuel pour les résumés
         temperature: 0.1,
         apiKey: process.env.GOOGLE_API_KEY,
         maxRetries: 2,
