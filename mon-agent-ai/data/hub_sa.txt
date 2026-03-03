@@ -1,0 +1,88 @@
+Liste des besoins HUB SA
+
+HUB SA est une entreprise qui gère les ninjas
+
+1️⃣ Accès & Contrôle
+
+Pour assurer l'audit, la maintenance et le développement des systèmes, j'ai besoin des accès suivants :
+
+Accès administrateur Odoo
+
+Accès serveur (VPS, Cloud ou local)
+
+Accès à la base de données
+
+Accès aux comptes d'hébergement web
+
+Accès au nom de domaine et à la configuration DNS
+
+Accès aux emails professionnels (si nécessaire pour Odoo)
+
+Accès au code source des applications internes
+
+Accès au contrat et documentation fournie par le sous-traitant
+
+2️⃣ Infrastructure technique
+
+Pour garantir la stabilité et la sécurité du système :
+
+Inventaire complet des machines et équipements IT
+
+Politique de sauvegarde et récupération des données
+
+Sécurité réseau et antivirus à jour
+
+Accès aux outils de gestion des mots de passe (si existants)
+
+Accès aux paramètres réseau et routeur si nécessaire
+
+3️⃣ Odoo
+
+Pour comprendre et améliorer l'utilisation actuelle d'Odoo :
+
+Liste complète des modules installés
+
+Liste des modules personnalisés ou développés par le sous-traitant
+
+Documentation et schéma des workflows
+
+Liste des utilisateurs et leurs rôles
+
+Historique des problèmes signalés et tickets en cours
+
+Accès aux logs et configurations pour audit
+
+4️⃣ Organisation & Processus
+
+Pour structurer mon travail et coordonner les interventions :
+
+Désignation d'un interlocuteur par service pour les entretiens
+
+Validation officielle des priorités et besoins critiques
+
+Planning de réunions régulières (hebdomadaire ou bi-hebdomadaire)
+
+Procédure claire pour soumettre et prioriser les demandes IT
+
+5️⃣ Moyens matériels
+
+Pour travailler efficacement :
+
+Machine performante (16GB RAM minimum)
+
+SSD rapide
+
+Connexion internet stable
+
+Écran supplémentaire recommandé
+
+Compte Git structuré pour versionnage et déploiement
+
+📌 Besoin stratégique
+
+Clarification de mon rôle exact : chef de projet Odoo, développeur seul, ou responsable IT général
+
+Pouvoir décisionnel technique pour modifications sur Odoo et systèmes internes
+
+💡 Objectif du document :
+Mettre en place un cadre clair pour l'audit, la maintenance et l'amélioration des systèmes IT et Odoo, tout en garantissant la sécurité, la performance et la collaboration avec les services.
