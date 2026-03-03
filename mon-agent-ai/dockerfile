@@ -1,0 +1,23 @@
+# Utiliser l'image officielle de Playwright qui contient déjà Node et les navigateurs
+FROM mcr.microsoft.com/playwright:v1.49.0-jammy
+
+# Dossier de travail
+WORKDIR /app
+
+# Copier les fichiers de dépendances
+COPY package*.json ./
+
+# Installer les dépendances
+RUN npm install
+
+# Copier le reste du code
+COPY . .
+
+# Installer les navigateurs Playwright explicitement (au cas où)
+RUN npx playwright install chromium
+
+# Exposer le port (Render/Railway utiliseront la variable PORT)
+EXPOSE 3000
+
+# Lancer le serveur avec ts-node (comme dans ton script dev/server)
+CMD ["npx", "ts-node", "src/server.ts"]
