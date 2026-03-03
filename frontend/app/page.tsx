@@ -42,7 +42,9 @@ export default function Home() {
       const data: ChatResponse = await res.json();
 
       if (!res.ok) {
-        throw new Error(data.response || 'Something went wrong');
+        const errorText = await res.text(); // Lire en texte plutôt qu'en JSON si ça échoue
+        console.error("Erreur serveur:", errorText);
+        throw new Error(`Le serveur a répondu avec l'erreur: ${res.status}`);
       }
 
       setResponse(data.response);
