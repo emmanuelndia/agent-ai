@@ -1,13 +1,12 @@
 import express, { Request, Response } from 'express';
 import cors from 'cors';
-import { traiterMessage } from './agent-complet';
-import { contextManager } from './agent-complet';
 import dotenv from 'dotenv';
 
 dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT) || 3000;
+
 
 // 1. On active le middleware de base immédiatement
 app.use(cors());
