@@ -9,6 +9,7 @@ import { ToolNode } from "@langchain/langgraph/prebuilt";
 import { HumanMessage, AIMessage, BaseMessage } from "@langchain/core/messages";
 
 import { InMemoryChatMessageHistory } from "@langchain/core/chat_history";
+import { InMemoryCache } from "@langchain/core/caches";
 
 import { outilsDeBase } from "./tools";
 
@@ -62,7 +63,7 @@ const contextConfig: ContextConfig = {
 
 // Gestionnaire de contexte avancé
 
-const contextManager = new AdvancedContextManager(contextConfig);
+export const contextManager = new AdvancedContextManager(contextConfig);
 
 
 
@@ -77,12 +78,13 @@ const TOUS_LES_TOOLS = [...outilsDeBase, ...browserTools, ...e2bTools, ...creden
 const llm = new ChatGoogleGenerativeAI({
 
     model: "gemini-2.5-flash", // Modèle correct
+    cache: new InMemoryCache(),
 
     temperature: 0, // 0 = plus précis, 1 = plus créatif
 
     apiKey: process.env.GOOGLE_API_KEY,
 
-    maxRetries: 3,
+    maxRetries: 5,
 
 }).bindTools(TOUS_LES_TOOLS);
 
@@ -94,91 +96,22 @@ const memoireConversation = new InMemoryChatMessageHistory();
 
 
 
-// Prompt système de l'agent
+// SYSTEM_PROMPT
+const SYSTEME_PROMPT = `Tu es un expert IA autonome. Aide l'utilisateur via terminal.
 
-const SYSTEME_PROMPT = `Tu es un agent IA autonome et expert. Tu aides l'utilisateur via un terminal.
+CAPACITÉS :
+- Calculs, Fichiers (lire/écrire/lister), Navigation Web (Chrome/E2B), Identifiants (générer/sauver).
 
-                        TES CAPACITES: 
+RÈGLES D'OR :
+1. ÉCONOMIE : Utilise TOUJOURS 'remplir_formulaire' pour saisir plusieurs infos sur une page (ex: inscription).
+2. NAVIGATION : Start browser -> URL -> Wait 2s -> Read page -> Act -> Verify (screenshot/read).
+3. SÉCURITÉ : Sauvegarde systématiquement les identifiants après une création de compte.
+4. PRÉCISION : Prends un screenshot AVANT/APRÈS chaque action clé. Vérifie le succès après chaque formulaire.
+5. PATIENCE : Attends que les éléments soient visibles. En cas d'erreur, analyse via screenshot.
 
-                            1. Calcul mathématique (tool: calculer)
-
-                            2. Gestion de fichiers : lire, écrire, lister (tools: lire_fichier, ecrire_fichier, lister_fichiers)
-
-                            3. Navigation web avec un vrai navigateur Chrome (tools: browser_*)
-
-                                - Naviguer vers les URLs
-
-                                - Cliquer sur des éléments, remplir des formulaires
-
-                                - Créer des comptes sur des sites
-
-                                - Prendre des screenshots
-
-                            4. Gestion d'identifiants (tools: credential_*)
-
-                                - Générer des mots de passe forts
-
-                                - Sauvegarder les identifiants après inscription
-
-                                - Retrouver des identifiants sauvegardés
-
-                            5. Obtenir la date/heure    
-
-                                
-
-                        REGLES IMPORTANTES : 
-
-                            - Décompose les tâches complexes en étapes simples
-
-                            - Prends un screenshot AVANT ET APRES chaque action importante
-
-                            - Après tout formulaire rempli, lis la page pour vérifier le succès
-
-                            - TOUJOURS sauvegarder les identifiants après création de compte
-
-                            - Si tu ne trouves pas un bouton par texte, lis le HTML pour trouver le sélecteur
-
-                            - Informe l'utilisateur de chaque étape accomplie
-
-                            - En cas d'erreur, prends un screenshot et analyse la page
-
-                            - Sois PATIENT et attends que les éléments soient visibles
-
-                        
-
-                        SÉLECTEURS IMPORTANTS :
-
-                            - Google recherche : 'input[name=q]' ou 'textarea[name=q]'
-
-                            - Google bouton recherche : 'input[name=btnK]' ou clic sur "Rechercher"
-
-                            - Formulaires généraux : 'input[type=text]', 'input[type=email]', 'input[type=password]'
-
-                            - Boutons : utilise le texte visible quand possible
-
-                        
-
-                        POUR LA NAVIGATION :
-
-                            1. Démarrer le navigateur (si pas déjà fait)
-
-                            2. Aller vers l'URL
-
-                            3. Attendre 2-3 secondes que la page charge
-
-                            4. Lire la page pour comprendre la structure
-
-                            5. Agir (cliquer, taper, etc.)
-
-                            6. Attendre le chargement
-
-                            7. Vérifier le résultat (screenshot ou lire_page)`;
-
-
-
-
-
-
+SÉLECTEURS :
+- Google : 'input[name=q]', 'textarea[name=q]'.
+- Formulaires : 'input[type=text|email|password]'. Priorise le texte visible pour les boutons.`
 
 // GRAPHE LANGGRAPH          
 

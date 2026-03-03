@@ -250,6 +250,28 @@ export const attendre = tool(
   }
 );
 
+// TOOL : REMPLIR UN FORMULAIRE
+export const remplir_formulaire = tool(
+  async ({ champs }) => {
+    try {
+      const page = navigateur.getPage();
+      for (const [selecteur, valeur] of Object.entries(champs)) {
+        await page.fill(selecteur, valeur as string);
+      }
+      return "Formulaire rempli avec succès.";
+    } catch (e) {
+      return `Erreur lors du remplissage : ${(e as Error).message}`;
+    }
+  },
+  {
+    name: "remplir_formulaire",
+    description: "Remplit plusieurs champs d'un formulaire en une seule fois.",
+    schema: z.object({
+      champs: z.record(z.string(), z.string()).describe("Objet clé-valeur (sélecteur: valeur)")
+    }),
+  }
+);
+
 // TOOL : COCHER UNE CASE 
 export const cocherCase = tool(
   async ({ sélecteur }) => {
@@ -300,6 +322,7 @@ export const browserTools = [
     taper,
     appuyerTouche,
     lirePage,
+    remplir_formulaire,
     screenshot,
     attendre,
     cocherCase,

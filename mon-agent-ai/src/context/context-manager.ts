@@ -2,6 +2,7 @@ import { BaseMessage, HumanMessage, AIMessage } from "@langchain/core/messages";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 import { ChatGroq } from "@langchain/groq";
 import { InMemoryChatMessageHistory } from "@langchain/core/chat_history";
+import { getEncoding } from "js-tiktoken";
 
 export interface ContextWindow {
   messages: BaseMessage[];
@@ -17,6 +18,9 @@ export interface ContextConfig {
   summaryInterval: number;
   keepLastNMessages: number;
 }
+
+// Initialisation de l'encodeur (en dehors de la classe pour ne le faire qu'une fois)
+const encoder = getEncoding("cl100k_base");
 
 export class AdvancedContextManager {
   private contextHistory: BaseMessage[] = [];
@@ -62,11 +66,41 @@ export class AdvancedContextManager {
   /**
    * Estime le nombre de tokens pour un message
    */
-  private estimateTokens(message: BaseMessage): number {
-    const content = String(message.content);
-    // Estimation simple: ~1 token = 4 caractères
-    return Math.ceil(content.length / 4);
+  private estimateTokens(message: BaseMessage | string): number {
+    let content = "";
+    
+    if (typeof message === "string") {
+      content = message;
+    } else {
+      // Gérer le contenu textuel du message
+      content = String(message.content);
+      
+      // OPTIMISATION : Si le message contient des images (multimodal), 
+      // il faut ajouter un forfait de tokens fixe (Gemini compte environ 258 tokens par image)
+      if (Array.isArray(message.content)) {
+        let total = 0;
+        for (const part of message.content) {
+          if (typeof part === 'object' && part !== null && 'type' in part) {
+            if (part.type === "text" && 'text' in part) {
+              total += encoder.encode(String(part.text)).length;
+            } else if (part.type === "image_url") {
+              total += 258; // Forfait standard pour Gemini
+            }
+          }
+        }
+        return total;
+      }
+    }
+
+    // Encodage et comptage précis
+    const tokens = encoder.encode(content);
+    return tokens.length;
   }
+
+  private calculateTotalTokens(messages: BaseMessage[]): number {
+    return messages.reduce((total, msg) => total + this.estimateTokens(msg), 0);
+  }
+
 
   /**
    * Ajoute un message au contexte avec gestion intelligente

@@ -1,6 +1,7 @@
 import { BaseMessage, HumanMessage, AIMessage } from "@langchain/core/messages";
 import { AdvancedContextManager } from "./context-manager";
 
+
 export type ContextStrategy = 'sliding-window' | 'summarization' | 'hybrid' | 'token-aware';
 
 export interface StrategyConfig {
