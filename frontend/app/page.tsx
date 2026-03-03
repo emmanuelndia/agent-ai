@@ -60,7 +60,7 @@ export default function Home() {
 
   const clearContext = async () => {
     try {
-      const res = await fetch('/api/context/clear', {
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/context/clear`, {
         method: 'POST',
       });
 
@@ -80,7 +80,7 @@ export default function Home() {
 
   const getContextStats = async () => {
     try {
-      const res = await fetch('/api/context/stats');
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/context/stats`);
       
       if (!res.ok) {
         throw new Error('Failed to get context stats');
@@ -170,6 +170,7 @@ export default function Home() {
                   className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors"
                 >
                   {loading ? 'Envoi...' : 'Envoyer'}
+                  
                 </button>
               </div>
             </div>
