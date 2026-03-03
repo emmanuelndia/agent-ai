@@ -1,0 +1,39 @@
+# Version simplifiée pour éviter les problèmes de mémoire
+FROM node:18-alpine
+
+WORKDIR /app
+
+# Copier les fichiers de dépendances
+COPY package*.json ./
+
+# Installer les dépendances
+RUN npm install --omit=dev
+
+# Copier le code source
+COPY . .
+
+# Créer le dossier dist
+RUN mkdir -p dist
+
+# Utiliser le build simple (copie des fichiers .ts en .js)
+RUN npm run build
+
+# Installer les dépendances système nécessaires pour Playwright
+RUN apk add --no-cache \
+    chromium \
+    nss \
+    freetype \
+    freetype-dev \
+    harfbuzz \
+    ca-certificates \
+    ttf-freefont
+
+# Définir les variables d'environnement pour Puppeteer/Playwright
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
+    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
+
+# Exposer le port
+EXPOSE 3000
+
+# Lancer l'application
+CMD ["npm", "start"]

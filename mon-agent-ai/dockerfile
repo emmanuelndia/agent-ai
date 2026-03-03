@@ -7,15 +7,15 @@ WORKDIR /app
 # 3. Copier les fichiers de dépendances
 COPY package*.json ./
 
-# 4. Installer les dépendances (y compris typescript pour le build)
+
+# Installer les dépendances
 RUN npm install
 
-# 5. Copier tout le code source
+# Copier le code
 COPY . .
 
-# 6. COMPILER le TypeScript en JavaScript (Crucial !)
-# Cela va créer un dossier /dist avec des fichiers .js
-RUN NODE_OPTIONS='--max-old-space-size=4096' npx tsc
+# Lancer le build avec la limite de RAM ajustée
+RUN NODE_OPTIONS='--max-old-space-size=450' npx tsc
 
 # 7. Installer Chromium pour Playwright
 RUN npx playwright install chromium
