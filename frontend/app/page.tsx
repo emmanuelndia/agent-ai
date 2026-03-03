@@ -39,16 +39,18 @@ export default function Home() {
         body: JSON.stringify({ message }),
       });
 
-      const data: ChatResponse = await res.json();
-
+      // SI ERREUR
       if (!res.ok) {
-        const errorText = await res.text(); // Lire en texte plutôt qu'en JSON si ça échoue
+        const errorText = await res.text(); // On lit l'erreur ici
         console.error("Erreur serveur:", errorText);
-        throw new Error(`Le serveur a répondu avec l'erreur: ${res.status}`);
+        throw new Error(`Le serveur a répondu: ${res.status} - ${errorText}`);
       }
 
+      // SI SUCCÈS (On ne lit le JSON qu'ici)
+      const data: ChatResponse = await res.json();
       setResponse(data.response);
       setContext(data.context || null);
+
     } catch (err) {
       setError((err as Error).message);
     } finally {
