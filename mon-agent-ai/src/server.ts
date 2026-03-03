@@ -21,7 +21,11 @@ export const config = {
 };
 
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: 'https://agent-ai-brown-chi.vercel.app', // Ton URL Vercel
+  methods: ['GET', 'POST'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 app.use(express.json());
 
 // Health check
