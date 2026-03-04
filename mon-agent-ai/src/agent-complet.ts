@@ -69,7 +69,7 @@ export const contextManager = new AdvancedContextManager(contextConfig);
 
 // Tous les tools disponibles pour l'agent (Playwright local + E2B sandbox)
 
-const TOUS_LES_TOOLS = [...outilsDeBase, ...e2bTools, ...credentialTools, ...debugTools];
+const TOUS_LES_TOOLS = [...outilsDeBase, /* ...browserTools,  */...e2bTools, ...credentialTools, ...debugTools];
 
 
 
