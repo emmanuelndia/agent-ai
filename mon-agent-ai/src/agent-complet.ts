@@ -50,7 +50,7 @@ const contextConfig: ContextConfig = {
 };
 
 // Tous les tools disponibles pour l'agent (Playwright local + E2B sandbox)
-const TOUS_LES_TOOLS = [...outilsDeBase, /* ...browserTools,  */...e2bTools, ...credentialTools, ...debugTools];
+const TOUS_LES_TOOLS = [...outilsDeBase, /* ...browserTools,  *//* ...e2bTools, ...credentialTools, ...debugTools */];
 
 // Le cerveau de l'agent (Google Generative AI)
 const llm = new ChatGroq({
@@ -103,6 +103,11 @@ const EtatAgent = Annotation.Root({
 
 // NOEUD LLM : REFLECHIT ET DECIDE QUOI FAIRE
 async function noeudLLM(etat: typeof EtatAgent.State) {
+    console.log("📥 Entrée dans noeudLLM. Nombre de messages:", etat.messages.length);
+    const dernier = etat.messages.at(-1);
+    if (dernier instanceof ToolMessage) {
+        console.log("🔧 Dernier message est un ToolMessage, contenu:", dernier.content);
+    }
     try {
         const optimizedContext = await contextManager.getOptimizedContext(SYSTEME_PROMPT);
         const allMessages = [...optimizedContext, ...etat.messages];
