@@ -27,10 +27,10 @@ export class AdvancedContextManager {
   private summaries: string[] = [];
   private currentWindow: ContextWindow;
   private config: ContextConfig;
-  private llm: ChatGroq | ChatGroq;
+  private llm: ChatGoogleGenerativeAI | ChatGroq;
   private messageHistory: InMemoryChatMessageHistory;
 
-  constructor(config: Partial<ContextConfig> = {}, llmInstance?: ChatGroq | ChatGroq) {
+  constructor(config: Partial<ContextConfig> = {}, llmInstance?: ChatGoogleGenerativeAI | ChatGroq) {
     this.config = {
       maxTokens: 32000, // Limite pour les modèles
       compressionThreshold: 0.8, // Compresser à 80% de la limite
@@ -42,15 +42,15 @@ export class AdvancedContextManager {
     // Utiliser l'instance LLM fournie ou en créer une selon la clé API disponible
     if (llmInstance) {
       this.llm = llmInstance;
-    } else if (process.env.GROQ_API_KEY) {
-      this.llm = new ChatGroq({
-        model: "llama-3.1-70b-versatile", // Modèle actuel pour les résumés
+    } else if (process.env.GOOGLE_API_KEY) {
+      this.llm = new ChatGoogleGenerativeAI({
+        model: "gemini-2.5-flash", // Modèle actuel pour les résumés
         temperature: 0.1,
-        apiKey: process.env.GROQ_API_KEY,
+        apiKey: process.env.GOOGLE_API_KEY,
         maxRetries: 2,
       });
     } else {
-      throw new Error("Aucune clé API GROQ trouvée. Veuillez configurer GROQ_API_KEY");
+      throw new Error("Aucune clé API Gemini trouvée. Veuillez configurer GOOGLE_API_KEY");
     }
 
     this.messageHistory = new InMemoryChatMessageHistory();

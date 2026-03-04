@@ -75,14 +75,14 @@ const TOUS_LES_TOOLS = [...outilsDeBase, ...browserTools, ...e2bTools, ...creden
 
 // Le cerveau de l'agent (Google Generative AI)
 
-const llm = new ChatGroq({
+const llm = new ChatGoogleGenerativeAI({
 
-    model: "llama-3.1-70b-versatile", // Ou ChatGroq llama-3.1-70b GROQ_API_KEY ou ChatGoogleGenerativeAI gemini-2.5-flash gemini-3-flash-preview GOOGLE_API_KEY
+    model: "gemini-2.5-flash", // Ou ChatGroq llama-3.1-70b GROQ_API_KEY ou ChatGoogleGenerativeAI gemini-2.5-flash gemini-3-flash-preview GOOGLE_API_KEY
     cache: new InMemoryCache(),
 
     temperature: 0, // 0 = plus précis, 1 = plus créatif
 
-    apiKey: process.env.GROQ_API_KEY,
+    apiKey: process.env.GOOGLE_API_KEY,
 
     maxRetries: 5,
 
@@ -113,92 +113,61 @@ SÉLECTEURS :
 - Google : 'input[name=q]', 'textarea[name=q]'.
 - Formulaires : 'input[type=text|email|password]'. Priorise le texte visible pour les boutons.`
 
-// GRAPHE LANGGRAPH          
+         
 
+// GRAPHE LANGGRAPH
 const EtatAgent = Annotation.Root({
-
     messages: Annotation<BaseMessage[]>({
-
         reducer: (ancien, nouveau) => [...ancien, ...nouveau],
-
-        default: () => [],  
-
+        default: () => [],
     }),
-
 });
 
 
 
 // NOEUD LLM : REFLECHIT ET DECIDE QUOI FAIRE
-
 async function noeudLLM(etat: typeof EtatAgent.State) {
-
-    await new Promise(resolve => setTimeout(resolve, 3000));
-    
-    // Utiliser le gestionnaire de contexte avancé
+    // Le délai n'est pas nécessaire pour la logique, mais peut être gardé pour le débogage
+    // await new Promise(resolve => setTimeout(resolve, 3000));
 
     const optimizedContext = await contextManager.getOptimizedContext(SYSTEME_PROMPT);
-
     
-
-    // Ajouter les messages actuels de l'état
-
     const allMessages = [
-
         ...optimizedContext,
-
         ...etat.messages,
-
     ];
 
-
-
-    // Afficher les stats de contexte pour debugging
-
     const stats = contextManager.getContextStats();
-
     console.log(`📊 Contexte: ${stats.totalMessages} messages, ${stats.currentTokens} tokens, compression: ${(1 - stats.compressionRatio) * 100}%`);
 
-
-
     const reponse = await llm.invoke(allMessages);
-
-    return {messages: [reponse]};
-
+    return { messages: [reponse] };
 }
 
 
+
+// NOEUD D'OUTILS
+const toolNode = new ToolNode(TOUS_LES_TOOLS);
 
 // DECISION : APPELER UN TOOL OU TERMINER ?
-
 function decider(etat: typeof EtatAgent.State): string {
-
-    const dernier = etat.messages.at(-1) as AIMessage;
-
-    if (!dernier.tool_calls?.length) return END;
-
+    const dernierMessage = etat.messages.at(-1);
+    if (!dernierMessage || !(dernierMessage instanceof AIMessage) || !dernierMessage.tool_calls?.length) {
+        return END;
+    }
     return "tools";
-
 }
-
 
 
 
 
 // CONSTRUIRE LE GRAPHE
-
 const graphe = new StateGraph(EtatAgent)
-
     .addNode("llm", noeudLLM)
-
-    .addNode("tools", new ToolNode(TOUS_LES_TOOLS))
-
+    .addNode("tools", toolNode)
     .addEdge(START, "llm")
-
     .addConditionalEdges("llm", decider)
-
     .addEdge("tools", "llm")
-
     .compile();
 
 
@@ -206,59 +175,36 @@ const graphe = new StateGraph(EtatAgent)
 
 
 // INTERFACE TERMINAL
-
 export async function traiterMessage(messageUtilisateur: string): Promise<string> {
-
     const messageEntrant = new HumanMessage(messageUtilisateur);
 
+    // L'état initial pour cette exécution inclut uniquement le nouveau message
+    const initialState = { messages: [messageEntrant] };
 
-
-    // Ajouter le message au gestionnaire de contexte
-
+    // Ajouter le message au gestionnaire de contexte global
     await contextManager.addMessage(messageEntrant);
 
-
-
-    // Invoquer le graphe
-
-    const resultat = await graphe.invoke({
-
-        messages: [messageEntrant],
-
+    // Invoquer le graphe avec l'état initial et une limite de récursion augmentée
+    const resultat = await graphe.invoke(initialState, {
+        recursionLimit: 100, // Augmenter la limite pour les tâches complexes
     });
 
-
-
     const reponseFinale = resultat.messages.at(-1);
-
     const contenu = String(reponseFinale?.content ?? "Pas de réponse.");
 
+    // Ajouter la réponse finale de l'IA au gestionnaire de contexte
+    if (contenu) {
+        await contextManager.addMessage(new AIMessage(contenu));
+    }
 
-
-    // Ajouter la réponse au gestionnaire de contexte
-
-    await contextManager.addMessage(new AIMessage(contenu));
-
-
-
-    // Maintenir la compatibilité avec l'ancien système
-
+    // Maintenir la compatibilité avec l'ancien système de mémoire (si nécessaire)
     await memoireConversation.addUserMessage(messageUtilisateur);
-
     await memoireConversation.addAIMessage(contenu);
 
-
-
-    // Afficher les statistiques de contexte
-
     const stats = contextManager.getContextStats();
-
     console.log(`💾 Mémoire: ${stats.totalMessages} msgs, ${stats.currentTokens} tokens, ${stats.summariesCount} résumés`);
 
-
-
     return contenu;
-
 }
 
 
