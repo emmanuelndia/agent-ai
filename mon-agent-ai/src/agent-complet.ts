@@ -103,21 +103,19 @@ const EtatAgent = Annotation.Root({
 
 // NOEUD LLM : REFLECHIT ET DECIDE QUOI FAIRE
 async function noeudLLM(etat: typeof EtatAgent.State) {
-    // Le délai n'est pas nécessaire pour la logique, mais peut être gardé pour le débogage
-    // await new Promise(resolve => setTimeout(resolve, 3000));
-
-    const optimizedContext = await contextManager.getOptimizedContext(SYSTEME_PROMPT);
-    
-    const allMessages = [
-        ...optimizedContext,
-        ...etat.messages,
-    ];
-
-    const stats = contextManager.getContextStats();
-    console.log(`📊 Contexte: ${stats.totalMessages} messages, ${stats.currentTokens} tokens, compression: ${(1 - stats.compressionRatio) * 100}%`);
-
-    const reponse = await llm.invoke(allMessages);
-    return { messages: [reponse] };
+    try {
+        const optimizedContext = await contextManager.getOptimizedContext(SYSTEME_PROMPT);
+        const allMessages = [...optimizedContext, ...etat.messages];
+        const stats = contextManager.getContextStats();
+        console.log(`📊 Contexte: ${stats.totalMessages} messages, ${stats.currentTokens} tokens, compression: ${(1 - stats.compressionRatio) * 100}%`);
+        
+        const reponse = await llm.invoke(allMessages);
+        return { messages: [reponse] };
+    } catch (error) {
+        console.error("❌ Erreur dans noeudLLM:", error);
+        const errorMessage = new AIMessage(`Désolé, une erreur technique est survenue avec le modèle : ${(error as Error).message}`);
+        return { messages: [errorMessage] };
+    }
 }
 
 
@@ -153,27 +151,29 @@ const graphe = new StateGraph(EtatAgent)
 // INTERFACE TERMINAL
 export async function traiterMessage(messageUtilisateur: string): Promise<string> {
     const messageEntrant = new HumanMessage(messageUtilisateur);
-
-    // L'état initial pour cette exécution inclut uniquement le nouveau message
-    const initialState = { messages: [messageEntrant] };
-
-    // Ajouter le message au gestionnaire de contexte global
     await contextManager.addMessage(messageEntrant);
 
-    // Invoquer le graphe avec l'état initial et une limite de récursion augmentée
-    const resultat = await graphe.invoke(initialState, {
-        recursionLimit: 100, // Augmenter la limite pour les tâches complexes
+    const resultat = await graphe.invoke({ messages: [messageEntrant] }, {
+        recursionLimit: 100,
     });
 
     const reponseFinale = resultat.messages.at(-1);
-    const contenu = String(reponseFinale?.content ?? "Pas de réponse.");
+    
+    // 🔍 LOG DE DÉBOGAGE
+    console.log("📨 Dernier message de l'état :", JSON.stringify(reponseFinale, null, 2));
 
-    // Ajouter la réponse finale de l'IA au gestionnaire de contexte
-    if (contenu) {
-        await contextManager.addMessage(new AIMessage(contenu));
+    let contenu = String(reponseFinale?.content ?? "Pas de réponse.");
+
+    // Si le contenu est vide, définir un message par défaut
+    if (!contenu.trim()) {
+        console.warn("⚠️ Le LLM a retourné une réponse vide. Utilisation d'un message par défaut.");
+        contenu = "[L'agent n'a pas généré de réponse textuelle. Il a peut-être utilisé des outils.]";
     }
 
-    // Maintenir la compatibilité avec l'ancien système de mémoire (si nécessaire)
+    // Ajouter la réponse au contexte (toujours)
+    await contextManager.addMessage(new AIMessage(contenu));
+
+    // (optionnel) Ancienne mémoire
     await memoireConversation.addUserMessage(messageUtilisateur);
     await memoireConversation.addAIMessage(contenu);
 

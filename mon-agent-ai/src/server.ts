@@ -124,9 +124,12 @@ app.post('/api/chat', async (req: Request, res: Response) => {
     console.log(`[${new Date().toISOString()}] Received message: ${message}`);
     
     const response = await traiterMessage(message);
-    const contextStats = contextManager.getContextStats();
     
-    console.log(`[${new Date().toISOString()}] Agent response: ${response.substring(0, 100)}...`);
+    console.log(`[${new Date().toISOString()}] Agent response: "${response}"`);
+    console.log(`[${new Date().toISOString()}] Response length: ${response?.length || 0}`);
+    console.log(`[${new Date().toISOString()}] Response type: ${typeof response}`);
+    
+    const contextStats = contextManager.getContextStats();
     
     res.json({
       response,
