@@ -150,37 +150,23 @@ const graphe = new StateGraph(EtatAgent)
 
 // INTERFACE TERMINAL
 export async function traiterMessage(messageUtilisateur: string): Promise<string> {
-    const messageEntrant = new HumanMessage(messageUtilisateur);
-    await contextManager.addMessage(messageEntrant);
-
-    const resultat = await graphe.invoke({ messages: [messageEntrant] }, {
-        recursionLimit: 100,
-    });
-
-    const reponseFinale = resultat.messages.at(-1);
-    
-    // 🔍 LOG DE DÉBOGAGE
-    console.log("📨 Dernier message de l'état :", JSON.stringify(reponseFinale, null, 2));
-
-    let contenu = String(reponseFinale?.content ?? "Pas de réponse.");
-
-    // Si le contenu est vide, définir un message par défaut
-    if (!contenu.trim()) {
-        console.warn("⚠️ Le LLM a retourné une réponse vide. Utilisation d'un message par défaut.");
-        contenu = "[L'agent n'a pas généré de réponse textuelle. Il a peut-être utilisé des outils.]";
+    try {
+        const messageEntrant = new HumanMessage(messageUtilisateur);
+        await contextManager.addMessage(messageEntrant);
+        const resultat = await graphe.invoke({ messages: [messageEntrant] }, { recursionLimit: 100 });
+        const reponseFinale = resultat.messages.at(-1);
+        let contenu = String(reponseFinale?.content ?? "Pas de réponse.");
+        if (!contenu.trim()) {
+            contenu = "[L'agent n'a pas généré de réponse textuelle. Il a peut-être utilisé des outils.]";
+        }
+        await contextManager.addMessage(new AIMessage(contenu));
+        return contenu;
+    } catch (error) {
+        console.error("❌ Erreur dans traiterMessage:", error);
+        const fallback = "Désolé, une erreur interne est survenue.";
+        await contextManager.addMessage(new AIMessage(fallback));
+        return fallback;
     }
-
-    // Ajouter la réponse au contexte (toujours)
-    await contextManager.addMessage(new AIMessage(contenu));
-
-    // (optionnel) Ancienne mémoire
-    await memoireConversation.addUserMessage(messageUtilisateur);
-    await memoireConversation.addAIMessage(contenu);
-
-    const stats = contextManager.getContextStats();
-    console.log(`💾 Mémoire: ${stats.totalMessages} msgs, ${stats.currentTokens} tokens, ${stats.summariesCount} résumés`);
-
-    return contenu;
 }
 
 

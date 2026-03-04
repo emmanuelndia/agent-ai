@@ -158,6 +158,13 @@ app.listen(PORT, () => {
   console.log(`🔧 CORS enabled for frontend communication\n`);
 }); */
 
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('Unhandled Rejection:', reason);
+});
+process.on('uncaughtException', (error) => {
+    console.error('Uncaught Exception:', error);
+});
+
 // Démarrage du serveur
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Serveur prêt sur le port ${PORT}`);
