@@ -7,6 +7,8 @@ dotenv.config();
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
+let traiterMessage: any;
+let contextManager: any;
 
 // 1. On active le middleware de base immédiatement
 app.use(cors());
@@ -14,17 +16,27 @@ app.use(express.json());
 
 // 2. ROUTE HEALTHCHECK PRIORITAIRE (Tout en haut)
 app.get('/health', (req, res) => {
-  res.status(200).send('OK');
+  res.status(200).json({ status: 'OK', loading: !traiterMessage });
 });
 
 // 3. ON DÉMARRE L'ÉCOUTE MAINTENANT
-const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Serveur Express démarré sur le port ${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Serveur prêt sur le port ${PORT}`);
+  
+  // On charge l'IA SEULEMENT APRÈS que le serveur soit en ligne
+  try {
+    const agent = require('./agent-complet');
+    traiterMessage = agent.traiterMessage;
+    contextManager = agent.contextManager;
+    console.log("✅ Logique IA chargée avec succès");
+  } catch (err) {
+    console.error("❌ Erreur chargement IA:", err);
+  }
 });
 
 // 4. ON IMPORTE LE RESTE APRÈS (Lazy Loading)
 // On déplace les imports lourds ici ou on s'assure qu'ils ne bloquent pas
-const { traiterMessage, contextManager } = require('./agent-complet');
+/* const { traiterMessage, contextManager } = require('./agent-complet'); */
 
 export const config = {
   api: {
