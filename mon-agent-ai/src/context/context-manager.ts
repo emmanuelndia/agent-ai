@@ -1,6 +1,6 @@
 import { BaseMessage, HumanMessage, AIMessage } from "@langchain/core/messages";
-import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
-import { ChatGroq } from "@langchain/groq";
+/* import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
+ */import { ChatGroq } from "@langchain/groq";
 import { InMemoryChatMessageHistory } from "@langchain/core/chat_history";
 import { getEncoding } from "js-tiktoken";
 
@@ -40,18 +40,10 @@ export class AdvancedContextManager {
     };
 
     // Utiliser l'instance LLM fournie ou en créer une selon la clé API disponible
-    if (llmInstance) {
-      this.llm = llmInstance;
-    } else if (process.env.GROQ_API_KEY) {
-      this.llm = new ChatGroq({
-        model: "llama-3.1-70b-versatile", // Modèle actuel pour les résumés
-        temperature: 0.1,
-        apiKey: process.env.GROQ_API_KEY,
-        maxRetries: 2,
-      });
-    } else {
-      throw new Error("Aucune clé API Gemini trouvée. Veuillez configurer GOOGLE_API_KEY");
+    if (!llmInstance) {
+      throw new Error("Aucun LLM fourni à AdvancedContextManager");
     }
+    this.llm = llmInstance;
 
     this.messageHistory = new InMemoryChatMessageHistory();
     
