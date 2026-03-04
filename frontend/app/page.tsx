@@ -48,8 +48,9 @@ export default function Home() {
 
       // SI SUCCÈS (On ne lit le JSON qu'ici)
       const data: ChatResponse = await res.json();
+      console.log("Réponse reçue:", data.response);
       setResponse(data.response);
-      setContext(data.context || null);
+      setContext(data.context || null);     
 
     } catch (err) {
       setError((err as Error).message);
