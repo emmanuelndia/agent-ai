@@ -27,10 +27,10 @@ export class AdvancedContextManager {
   private summaries: string[] = [];
   private currentWindow: ContextWindow;
   private config: ContextConfig;
-  private llm: ChatGoogleGenerativeAI | ChatGroq;
+  private llm: ChatGroq;
   private messageHistory: InMemoryChatMessageHistory;
 
-  constructor(config: Partial<ContextConfig> = {}, llmInstance?: ChatGoogleGenerativeAI | ChatGroq) {
+  constructor(config: Partial<ContextConfig> = {}, llmInstance?: ChatGroq) {
     this.config = {
       maxTokens: 32000, // Limite pour les modèles
       compressionThreshold: 0.8, // Compresser à 80% de la limite

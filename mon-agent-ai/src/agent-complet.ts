@@ -63,7 +63,8 @@ const contextConfig: ContextConfig = {
 
 // Gestionnaire de contexte avancé
 
-export const contextManager = new AdvancedContextManager(contextConfig, llm);
+export const contextManager = new AdvancedContextManager(contextConfig);
+
 
 
 // Tous les tools disponibles pour l'agent (Playwright local + E2B sandbox)
