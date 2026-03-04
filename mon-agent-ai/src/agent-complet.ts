@@ -1,41 +1,22 @@
 import { ChatGroq } from "@langchain/groq";
-
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
-
 import { StateGraph, Annotation, END, START } from "@langchain/langgraph";
-
 import { ToolNode } from "@langchain/langgraph/prebuilt";
-
-import { HumanMessage, AIMessage, BaseMessage } from "@langchain/core/messages";
-
+import { HumanMessage, AIMessage, BaseMessage, ToolMessage } from "@langchain/core/messages";
 import { InMemoryChatMessageHistory } from "@langchain/core/chat_history";
 import { InMemoryCache } from "@langchain/core/caches";
-
 import { outilsDeBase } from "./tools";
-
 import { browserTools } from "./browser/browser-tools";
-
 import { e2bTools } from "./browser/e2b-tools";
-
 import { credentialTools } from "./browser/credentials";
-
 import { debugTools } from "./browser/debug-tools";
-
 import { navigateur } from "./browser/browser-manager";
-
 import { e2bSandbox } from "./browser/e2b-sandbox";
-
 import { AdvancedContextManager, ContextConfig } from "./context/context-manager";
-
 import { ContextStrategyFactory, ContextStrategy } from "./context/context-strategies";
-
 import * as readline from "readline";
-
 import * as dotenv from "dotenv";
-
 import console from "console";
-
-
 
 dotenv.config();
 
@@ -50,14 +31,14 @@ const contextConfig: ContextConfig = {
 };
 
 // Tous les tools disponibles pour l'agent (Playwright local + E2B sandbox)
-const TOUS_LES_TOOLS = [...outilsDeBase, /* ...browserTools,  *//* ...e2bTools, ...credentialTools, ...debugTools */];
+const TOUS_LES_TOOLS = [...outilsDeBase, /* ...browserTools,  */...e2bTools, ...credentialTools, ...debugTools];
 
 // Le cerveau de l'agent (Google Generative AI)
-const llm = new ChatGroq({
-    model: "llama-3.3-70b-versatile", // Ou ChatGroq llama-3.1-70b GROQ_API_KEY ou ChatGoogleGenerativeAI gemini-2.5-flash gemini-3-flash-preview GOOGLE_API_KEY
+const llm = new ChatGoogleGenerativeAI({
+    model: "gemini-2.5-flash", // Ou ChatGroq llama-3.1-70b GROQ_API_KEY ou ChatGoogleGenerativeAI gemini-2.5-flash gemini-3-flash-preview GOOGLE_API_KEY
     cache: new InMemoryCache(),
     temperature: 0, // 0 = plus précis, 1 = plus créatif
-    apiKey: process.env.GROQ_API_KEY,
+    apiKey: process.env.GOOGLE_API_KEY,
     maxRetries: 5,
 }).bindTools(TOUS_LES_TOOLS);
 
@@ -73,22 +54,45 @@ const memoireConversation = new InMemoryChatMessageHistory();
 
 
 // SYSTEM_PROMPT
-const SYSTEME_PROMPT = `Tu es un expert IA autonome. Aide l'utilisateur via terminal.
+const SYSTEME_PROMPT = `Tu es un expert IA autonome. Tu disposes des outils suivants pour interagir avec le monde extérieur. Réponds toujours en français.
 
-CAPACITÉS :
-- Calculs, Fichiers (lire/écrire/lister), Navigation Web (Chrome/E2B), Identifiants (générer/sauver).
+OUTILS DISPONIBLES :
+- demarrer_sandbox : Démarre une sandbox E2B avec un navigateur. À utiliser lorsque l'utilisateur demande d'ouvrir un navigateur, d'aller sur Internet, de lancer Chrome, etc.
+- aller_vers_e2b : Navigue vers une URL (ex: "https://google.com") dans la sandbox.
+- cliquer_e2b : Clique sur un élément (par sélecteur CSS ou texte visible).
+- taper_e2b : Tape du texte dans un champ de formulaire.
+- lire_page_e2b : Lit le contenu textuel de la page actuelle.
+- screenshot_e2b : Prend une capture d'écran de la page.
+- attendre_e2b : Attend un élément, un texte ou un délai (en ms).
+- cocher_case_e2b : Coche ou décoche une case.
+- scroller_e2b : Fait défiler la page.
+- calculer : Évalue une expression mathématique.
+- lire_fichier : Lit le contenu d'un fichier.
+- ecrire_fichier : Écrit du contenu dans un fichier.
+- lister_fichiers : Liste les fichiers d'un dossier.
+- obtenir_date : Donne la date et l'heure actuelles.
+- sauvegarder_credential : Sauvegarde des identifiants après une inscription.
+- lire_credential : Récupère des identifiants sauvegardés.
+- generate_mot_de_passe : Génère un mot de passe fort.
+- diagnostic_navigateur : Diagnostique l'état du navigateur.
+- tester_selecteur : Teste un sélecteur CSS.
 
 RÈGLES D'OR :
-1. ÉCONOMIE : Utilise TOUJOURS 'remplir_formulaire' pour saisir plusieurs infos sur une page (ex: inscription).
-2. NAVIGATION : Start browser -> URL -> Wait 2s -> Read page -> Act -> Verify (screenshot/read).
-3. SÉCURITÉ : Sauvegarde systématiquement les identifiants après une création de compte.
-4. PRÉCISION : Prends un screenshot AVANT/APRÈS chaque action clé. Vérifie le succès après chaque formulaire.
-5. PATIENCE : Attends que les éléments soient visibles. En cas d'erreur, analyse via screenshot.
+1. Lorsque l'utilisateur demande une action qui correspond à un outil, tu DOIS appeler cet outil immédiatement, sans réponse textuelle préalable.
+2. Exemple : si l'utilisateur dit "ouvre un navigateur", appelle demarrer_sandbox.
+3. Si l'utilisateur te salue (bonjour, salut), réponds de manière amicale sans utiliser d'outils.
+4. Après avoir exécuté un outil, tu recevras son résultat. Tu dois alors fournir une réponse textuelle à l'utilisateur en synthétisant ce résultat.
+5. Pour la navigation web, la procédure typique est :
+   - Si le navigateur n'est pas encore ouvert, appelle demarrer_sandbox.
+   - Ensuite, utilise aller_vers_e2b pour charger une URL.
+   - Puis utilise les outils d'interaction (cliquer, taper, etc.) et de vérification (lire_page_e2b, screenshot_e2b).
+6. Sécurité : après une création de compte, sauvegarde toujours les identifiants avec sauvegarder_credential.
+7. Précision : prends un screenshot avant/après chaque action clé pour vérifier.
+8. Patience : utilise attendre_e2b pour laisser le temps aux éléments d'apparaître.
 
-SÉLECTEURS :
-- Google : 'input[name=q]', 'textarea[name=q]'.
-- Formulaires : 'input[type=text|email|password]'. Priorise le texte visible pour les boutons.`
-
+SÉLECTEURS COURANTS :
+- Google : 'input[name="q"]', 'textarea[name="q"]'.
+- Formulaires : privilégie les sélecteurs par texte pour les boutons (ex: { "selector": "button:has-text('Se connecter')" } ).`
          
 
 // GRAPHE LANGGRAPH
@@ -115,6 +119,7 @@ async function noeudLLM(etat: typeof EtatAgent.State) {
         console.log(`📊 Contexte: ${stats.totalMessages} messages, ${stats.currentTokens} tokens, compression: ${(1 - stats.compressionRatio) * 100}%`);
         
         const reponse = await llm.invoke(allMessages);
+        console.log("📤 Réponse LLM brute:", JSON.stringify(reponse, null, 2));
         return { messages: [reponse] };
     } catch (error) {
         console.error("❌ Erreur dans noeudLLM:", error);
@@ -132,8 +137,16 @@ console.log(toolNode);
 // DECISION : APPELER UN TOOL OU TERMINER ?
 function decider(etat: typeof EtatAgent.State): string {
     const dernierMessage = etat.messages.at(-1);
-    console.log("decider - dernier message type:", dernierMessage?.constructor.name);
-    if (dernierMessage instanceof AIMessage && dernierMessage.tool_calls?.length) {
+    console.log("decider - dernier message complet:", JSON.stringify(dernierMessage, (key, value) => 
+    typeof value === 'function' ? undefined : value, 2));
+    
+    // Vérification robuste de la présence de tool_calls
+    const hasToolCalls = 
+        (dernierMessage?.tool_calls && dernierMessage.tool_calls.length > 0) ||
+        (dernierMessage?.additional_kwargs?.tool_calls && dernierMessage.additional_kwargs.tool_calls.length > 0) ||
+        ((dernierMessage as any)?.kwargs?.tool_calls && (dernierMessage as any).kwargs.tool_calls.length > 0);
+
+    if (hasToolCalls) {
         console.log("decider - tool_calls détectés, direction tools");
         return "tools";
     }
@@ -319,13 +332,13 @@ async function demarrerInterface() {
 // --- SECTION DE DÉMARRAGE ---
 
 // On définit une fonction pour lancer la console
-/* async function executerModeConsole() {
+async function executerModeConsole() {
   try {
     await demarrerInterface();
   } catch (error) {
     console.error("Erreur interface console:", error);
   }
-} */
+}
 
 
 // Lancer l'agent
@@ -333,6 +346,6 @@ async function demarrerInterface() {
 // On ne lance l'interface console QUE si on exécute ce fichier directement
 // (ex: npx ts-node src/agent-complet.ts)
 // Si c'est server.ts qui l'importe, cette partie sera ignorée.
-/* if (require.main === module) {
+if (require.main === module) {
     executerModeConsole();
-} */
+}

@@ -1,6 +1,6 @@
 import { BaseMessage, HumanMessage, AIMessage } from "@langchain/core/messages";
-/* import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
- */import { ChatGroq } from "@langchain/groq";
+import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
+import { ChatGroq } from "@langchain/groq";
 import { InMemoryChatMessageHistory } from "@langchain/core/chat_history";
 import { getEncoding } from "js-tiktoken";
 
@@ -27,10 +27,10 @@ export class AdvancedContextManager {
   private summaries: string[] = [];
   private currentWindow: ContextWindow;
   private config: ContextConfig;
-  private llm: ChatGroq;
+  private llm: ChatGoogleGenerativeAI;
   private messageHistory: InMemoryChatMessageHistory;
 
-  constructor(config: Partial<ContextConfig> = {}, llmInstance?: ChatGroq) {
+  constructor(config: Partial<ContextConfig> = {}, llmInstance?: ChatGoogleGenerativeAI) {
     this.config = {
       maxTokens: 32000, // Limite pour les modèles
       compressionThreshold: 0.8, // Compresser à 80% de la limite
