@@ -7,19 +7,45 @@ dotenv.config();
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
-let traiterMessage: any;
+// Déclaration des variables qui contiendront l'agent
+let traiterMessage: (message: string) => Promise<string>;
 let contextManager: any;
+let agentReady = false;
+let agentLoadingPromise: Promise<void>;
 
-// 1. On active le middleware de base immédiatement
+// Fonction de chargement de l'agent
+async function loadAgent() {
+  try {
+    // Utilisation de import() dynamique (compatible ES module)
+    const agent = await import('./agent-complet.js');
+    traiterMessage = agent.traiterMessage;
+    contextManager = agent.contextManager;
+    agentReady = true;
+    console.log("✅ Logique IA chargée avec succès");
+  } catch (err) {
+    console.error("❌ Erreur chargement IA:", err);
+    agentReady = false;
+  }
+}
+
+// Démarrer le chargement immédiatement (sans bloquer le démarrage du serveur)
+agentLoadingPromise = loadAgent();
+
+// Middlewares
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
-// 2. ROUTE HEALTHCHECK PRIORITAIRE (Tout en haut)
+// Route healthcheck immédiate (ne dépend pas de l'agent)
 app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'OK', loading: !traiterMessage });
+  res.status(200).json({ status: 'OK', loading: !agentReady });
 });
 
-// 3. ON DÉMARRE L'ÉCOUTE MAINTENANT
+// Route principale
+app.get('/', (req, res) => {
+  res.send('<h1>🚀 Agent AI Backend est en ligne !</h1>');
+});
+
+/* // 3. ON DÉMARRE L'ÉCOUTE MAINTENANT
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Serveur prêt sur le port ${PORT}`);
   
@@ -32,7 +58,24 @@ app.listen(PORT, '0.0.0.0', () => {
   } catch (err) {
     console.error("❌ Erreur chargement IA:", err);
   }
-});
+}); */
+
+// Middleware pour s'assurer que l'agent est prêt avant les routes qui en ont besoin
+async function ensureAgentReady(req: Request, res: Response, next: Function) {
+  if (!agentReady) {
+    // On attend que le chargement soit fini (jusqu'à 10s)
+    try {
+      await Promise.race([
+        agentLoadingPromise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout chargement agent')), 10000))
+      ]);
+    } catch (err) {
+      return res.status(503).json({ error: 'Agent non disponible, veuillez réessayer plus tard' });
+    }
+  }
+  next();
+}
+
 
 // 4. ON IMPORTE LE RESTE APRÈS (Lazy Loading)
 // On déplace les imports lourds ici ou on s'assure qu'ils ne bloquent pas
@@ -46,39 +89,27 @@ export const config = {
   },
 };
 
-app.get('/', (req, res) => {
-  res.send('<h1>🚀 Agent AI Backend est en ligne !</h1><p>Le serveur fonctionne et attend les requêtes du frontend.</p>');
-});
 
 
-// Health check
-app.get('/health', (req: Request, res: Response) => {
-  res.json({ status: 'OK', message: 'Agent AI Backend is running' });
-});
 
-// Context stats endpoint
+// Appliquer le middleware aux routes qui utilisent l'agent
+app.use('/api', ensureAgentReady);
+
+
+// Routes API
 app.get('/api/context/stats', (req: Request, res: Response) => {
   try {
     const stats = contextManager.getContextStats();
-    res.json({
-      status: 'OK',
-      context: stats,
-      timestamp: new Date().toISOString()
-    });
+    res.json({ status: 'OK', context: stats, timestamp: new Date().toISOString() });
   } catch (error) {
     res.status(500).json({ error: 'Failed to get context stats' });
   }
 });
 
-// Clear context endpoint
 app.post('/api/context/clear', async (req: Request, res: Response) => {
   try {
     await contextManager.clearContext();
-    res.json({ 
-      status: 'OK', 
-      message: 'Context cleared successfully',
-      timestamp: new Date().toISOString()
-    });
+    res.json({ status: 'OK', message: 'Context cleared successfully', timestamp: new Date().toISOString() });
   } catch (error) {
     res.status(500).json({ error: 'Failed to clear context' });
   }
@@ -88,21 +119,14 @@ app.post('/api/context/clear', async (req: Request, res: Response) => {
 app.post('/api/chat', async (req: Request, res: Response) => {
   try {
     const { message } = req.body;
-    
-    if (!message) {
-      return res.status(400).json({ error: 'Message is required' });
-    }
+    if (!message) return res.status(400).json({ error: 'Message is required' });
 
     console.log(`[${new Date().toISOString()}] Received message: ${message}`);
     
-    // Traiter le message avec l'agent LangChain
     const response = await traiterMessage(message);
-    
-    // Récupérer les statistiques de contexte
     const contextStats = contextManager.getContextStats();
     
     console.log(`[${new Date().toISOString()}] Agent response: ${response.substring(0, 100)}...`);
-    console.log(`📊 Context stats: ${contextStats.totalMessages} msgs, ${contextStats.currentTokens} tokens`);
     
     res.json({
       response,
@@ -117,10 +141,7 @@ app.post('/api/chat', async (req: Request, res: Response) => {
     
   } catch (error) {
     console.error('Error processing message:', error);
-    res.status(500).json({ 
-      error: 'Internal server error',
-      message: (error as Error).message 
-    });
+    res.status(500).json({ error: 'Internal server error', message: (error as Error).message });
   }
 });
 
@@ -133,5 +154,10 @@ app.listen(PORT, () => {
   console.log(`🧹 Clear context: POST http://localhost:${PORT}/api/context/clear`);
   console.log(`🔧 CORS enabled for frontend communication\n`);
 }); */
+
+// Démarrage du serveur
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Serveur prêt sur le port ${PORT}`);
+});
 
 export default app;

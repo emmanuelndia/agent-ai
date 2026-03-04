@@ -42,51 +42,28 @@ dotenv.config();
 
 
 // CONFIGURATION
-
-
-
-// Configuration du contexte avancé
-
 const contextConfig: ContextConfig = {
-
-  maxTokens: 28000, // Laisse de la marge pour Gemini 2.5 Flash (32k max)
-
-  compressionThreshold: 0.75, // Compresser à 75% de la limite
-
-  summaryInterval: 8, // Résumer toutes les 8 interactions
-
-  keepLastNMessages: 4 // Toujours garder les 4 derniers messages
-
+  maxTokens: 28000,
+  compressionThreshold: 0.75,
+  summaryInterval: 8,
+  keepLastNMessages: 4
 };
 
+// Tous les tools disponibles pour l'agent (Playwright local + E2B sandbox)
+const TOUS_LES_TOOLS = [...outilsDeBase, /* ...browserTools,  */...e2bTools, ...credentialTools, ...debugTools];
+
+// Le cerveau de l'agent (Google Generative AI)
+const llm = new ChatGroq({
+    model: "llama-3.3-70b-versatile", // Ou ChatGroq llama-3.1-70b GROQ_API_KEY ou ChatGoogleGenerativeAI gemini-2.5-flash gemini-3-flash-preview GOOGLE_API_KEY
+    cache: new InMemoryCache(),
+    temperature: 0, // 0 = plus précis, 1 = plus créatif
+    apiKey: process.env.GROQ_API_KEY,
+    maxRetries: 5,
+}).bindTools(TOUS_LES_TOOLS);
 
 
 // Gestionnaire de contexte avancé
-
 export const contextManager = new AdvancedContextManager(contextConfig, llm);
-
-
-// Tous les tools disponibles pour l'agent (Playwright local + E2B sandbox)
-
-const TOUS_LES_TOOLS = [...outilsDeBase, /* ...browserTools,  */...e2bTools, ...credentialTools, ...debugTools];
-
-
-
-// Le cerveau de l'agent (Google Generative AI)
-
-const llm = new ChatGroq({
-
-    model: "llama-3.1-70b-versatile", // Ou ChatGroq llama-3.1-70b GROQ_API_KEY ou ChatGoogleGenerativeAI gemini-2.5-flash gemini-3-flash-preview GOOGLE_API_KEY
-    cache: new InMemoryCache(),
-
-    temperature: 0, // 0 = plus précis, 1 = plus créatif
-
-    apiKey: process.env.GROQ_API_KEY,
-
-    maxRetries: 5,
-
-}).bindTools(TOUS_LES_TOOLS);
-
 
 
 // Ancienne mémoire conservée pour compatibilité

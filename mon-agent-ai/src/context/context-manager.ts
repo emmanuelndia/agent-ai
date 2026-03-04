@@ -7,7 +7,7 @@ import { getEncoding } from "js-tiktoken";
 export interface ContextWindow {
   messages: BaseMessage[];
   totalTokens: number;
-  maxTokens: number;
+  maxTokens: number;  
   summary?: string;
   compressedMessages: BaseMessage[];
 }
