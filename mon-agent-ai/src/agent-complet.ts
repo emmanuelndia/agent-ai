@@ -122,14 +122,18 @@ async function noeudLLM(etat: typeof EtatAgent.State) {
 
 // NOEUD D'OUTILS
 const toolNode = new ToolNode(TOUS_LES_TOOLS);
+console.log(toolNode);
 
 // DECISION : APPELER UN TOOL OU TERMINER ?
 function decider(etat: typeof EtatAgent.State): string {
     const dernierMessage = etat.messages.at(-1);
-    if (!dernierMessage || !(dernierMessage instanceof AIMessage) || !dernierMessage.tool_calls?.length) {
-        return END;
+    console.log("decider - dernier message type:", dernierMessage?.constructor.name);
+    if (dernierMessage instanceof AIMessage && dernierMessage.tool_calls?.length) {
+        console.log("decider - tool_calls détectés, direction tools");
+        return "tools";
     }
-    return "tools";
+    console.log("decider - pas de tool_calls, direction END");
+    return END;
 }
 
 
