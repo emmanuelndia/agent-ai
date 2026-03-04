@@ -187,7 +187,7 @@ export default function Home() {
             {response && (
               <div className="bg-green-50 border border-green-200 rounded-lg p-4">
                 <h3 className="font-semibold text-green-800 mb-2">Réponse de l'agent:</h3>
-                <div className="text-gray-700 whitespace-pre-wrap">{response}</div>
+                <div className="text-gray-700 whitespace-pre-wrap">Ceci est un test</div>{/* {response} */}
               </div>
             )}
 
