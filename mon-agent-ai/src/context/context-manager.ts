@@ -42,11 +42,11 @@ export class AdvancedContextManager {
     // Utiliser l'instance LLM fournie ou en créer une selon la clé API disponible
     if (llmInstance) {
       this.llm = llmInstance;
-    } else if (process.env.GOOGLE_API_KEY) {
-      this.llm = new ChatGoogleGenerativeAI({
-        model: "gemini-2.5-flash", // Modèle actuel pour les résumés
+    } else if (process.env.GROQ_API_KEY) {
+      this.llm = new ChatGroq({
+        model: "llama-3.1-70b-versatile", // Modèle actuel pour les résumés
         temperature: 0.1,
-        apiKey: process.env.GOOGLE_API_KEY,
+        apiKey: process.env.GROQ_API_KEY,
         maxRetries: 2,
       });
     } else {

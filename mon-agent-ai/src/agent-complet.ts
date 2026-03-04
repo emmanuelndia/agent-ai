@@ -75,14 +75,14 @@ const TOUS_LES_TOOLS = [...outilsDeBase, /* ...browserTools,  */...e2bTools, ...
 
 // Le cerveau de l'agent (Google Generative AI)
 
-const llm = new ChatGoogleGenerativeAI({
+const llm = new ChatGroq({
 
-    model: "gemini-2.5-flash", // Ou ChatGroq llama-3.1-70b GROQ_API_KEY ou ChatGoogleGenerativeAI gemini-2.5-flash gemini-3-flash-preview GOOGLE_API_KEY
+    model: "llama-3.1-70b-versatile", // Ou ChatGroq llama-3.1-70b GROQ_API_KEY ou ChatGoogleGenerativeAI gemini-2.5-flash gemini-3-flash-preview GOOGLE_API_KEY
     cache: new InMemoryCache(),
 
     temperature: 0, // 0 = plus précis, 1 = plus créatif
 
-    apiKey: process.env.GOOGLE_API_KEY,
+    apiKey: process.env.GROQ_API_KEY,
 
     maxRetries: 5,
 
