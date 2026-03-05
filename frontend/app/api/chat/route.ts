@@ -36,6 +36,7 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({
       response: data.response,
+      screenshot: data.screenshot ?? null, // ✅ Transmettre le screenshot au frontend
       timestamp: data.timestamp,
     });
 

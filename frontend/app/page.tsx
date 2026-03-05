@@ -11,6 +11,7 @@ interface ContextStats {
 
 interface ChatResponse {
   response: string;
+  screenshot?: string | null; // ✅ Nouveau champ pour les captures d'écran
   context?: ContextStats;
   timestamp: string;
 }
@@ -18,6 +19,7 @@ interface ChatResponse {
 export default function Home() {
   const [message, setMessage] = useState('');
   const [response, setResponse] = useState('');
+  const [screenshot, setScreenshot] = useState<string | null>(null); // ✅ État pour le screenshot
   const [context, setContext] = useState<ContextStats | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -28,6 +30,7 @@ export default function Home() {
     setLoading(true);
     setError('');
     setResponse('');
+    setScreenshot(null); // ✅ Réinitialiser le screenshot
     setContext(null);
 
     try {
@@ -50,6 +53,7 @@ export default function Home() {
       const data: ChatResponse = await res.json();
       console.log("Réponse reçue:", data.response);
       setResponse(data.response);
+      setScreenshot(data.screenshot ?? null); // ✅ Stocker le screenshot s'il existe
       setContext(data.context || null);     
 
     } catch (err) {
@@ -184,13 +188,25 @@ export default function Home() {
             )}
 
             {/* Response Section */}
-            {response && (
-              <div className="bg-green-50 border border-green-200 rounded-lg p-4">
+            {(response || screenshot) && (
+              <div className="bg-green-50 border border-green-200 rounded-lg p-4 space-y-3">
                 <h3 className="font-semibold text-green-800 mb-2">Réponse de l'agent:</h3>
-                {response.startsWith('data:image') ? (
-                  <img src={response} alt="Screenshot" className="max-w-full rounded border" />
-                ) : (
+
+                {/* ✅ Texte de l'agent (toujours affiché s'il existe) */}
+                {response && (
                   <div className="text-gray-700 whitespace-pre-wrap">{response}</div>
+                )}
+
+                {/* ✅ Screenshot affiché séparément sous le texte */}
+                {screenshot && (
+                  <div>
+                    <p className="text-sm text-green-700 font-medium mb-1">📸 Capture d'écran :</p>
+                    <img
+                      src={screenshot}
+                      alt="Capture d'écran du navigateur"
+                      className="max-w-full rounded border border-green-300 shadow-sm"
+                    />
+                  </div>
                 )}
               </div>
             )}

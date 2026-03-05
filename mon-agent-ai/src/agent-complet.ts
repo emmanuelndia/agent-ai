@@ -171,31 +171,44 @@ const graphe = new StateGraph(EtatAgent)
 
 
 // INTERFACE TERMINAL
-export async function traiterMessage(messageUtilisateur: string): Promise<string> {
+export interface AgentResponse {
+    text: string;
+    screenshot?: string; // data:image/png;base64,... si un screenshot a été pris
+}
+
+export async function traiterMessage(messageUtilisateur: string): Promise<AgentResponse> {
     try {
         const messageEntrant = new HumanMessage(messageUtilisateur);
         await contextManager.addMessage(messageEntrant);
         const resultat = await graphe.invoke({ messages: [messageEntrant] }, { recursionLimit: 100 });
-        const reponseFinale = resultat.messages.at(-1);
-        
-        // Si le dernier message est un ToolMessage contenant une image (data URL), on le renvoie directement
-        if (reponseFinale instanceof ToolMessage && 
-            typeof reponseFinale.content === 'string' && 
-            reponseFinale.content.startsWith('data:image')) {
-            return reponseFinale.content;
+
+        // ✅ FIX : Scanner TOUS les messages pour trouver le screenshot le plus récent.
+        // Le dernier message est toujours un AIMessage (LangGraph repasse par le LLM
+        // après chaque tool), donc on ne peut pas se fier uniquement au dernier message.
+        let screenshotData: string | undefined;
+        for (const msg of resultat.messages) {
+            if (
+                msg instanceof ToolMessage &&
+                typeof msg.content === 'string' &&
+                msg.content.startsWith('data:image')
+            ) {
+                screenshotData = msg.content; // on garde le dernier screenshot trouvé
+            }
         }
-        
+
+        const reponseFinale = resultat.messages.at(-1);
         let contenu = String(reponseFinale?.content ?? "Pas de réponse.");
         if (!contenu.trim()) {
-            contenu = "[L'agent n'a pas généré de réponse textuelle. Il a peut-être utilisé des outils.]";
+            contenu = "[L'agent n'a pas généré de réponse textuelle.]";
         }
         await contextManager.addMessage(new AIMessage(contenu));
-        return contenu;
+
+        return { text: contenu, screenshot: screenshotData };
     } catch (error) {
         console.error("❌ Erreur dans traiterMessage:", error);
         const fallback = "Désolé, une erreur interne est survenue.";
         await contextManager.addMessage(new AIMessage(fallback));
-        return fallback;
+        return { text: fallback };
     }
 }
 

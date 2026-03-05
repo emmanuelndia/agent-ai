@@ -123,16 +123,17 @@ app.post('/api/chat', async (req: Request, res: Response) => {
 
     console.log(`[${new Date().toISOString()}] Received message: ${message}`);
     
-    const response = await traiterMessage(message);
+    // ✅ FIX : traiterMessage retourne maintenant { text, screenshot? }
+    const agentResponse = await traiterMessage(message);
     
-    console.log(`[${new Date().toISOString()}] Agent response: "${response}"`);
-    console.log(`[${new Date().toISOString()}] Response length: ${response?.length || 0}`);
-    console.log(`[${new Date().toISOString()}] Response type: ${typeof response}`);
+    console.log(`[${new Date().toISOString()}] Agent response text: "${agentResponse.text}"`);
+    console.log(`[${new Date().toISOString()}] Screenshot present: ${!!agentResponse.screenshot}`);
     
     const contextStats = contextManager.getContextStats();
     
     res.json({
-      response,
+      response: agentResponse.text,
+      screenshot: agentResponse.screenshot ?? null, // ✅ Transmis séparément au frontend
       context: {
         totalMessages: contextStats.totalMessages,
         currentTokens: contextStats.currentTokens,
