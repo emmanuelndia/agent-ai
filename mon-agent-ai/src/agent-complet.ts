@@ -35,7 +35,7 @@ const TOUS_LES_TOOLS = [...outilsDeBase, /* ...browserTools,  */...e2bTools, ...
 
 // Le cerveau de l'agent (Google Generative AI)
 const llm = new ChatGoogleGenerativeAI({
-    model: "gemini-2.5-flash", // Ou ChatGroq llama-3.1-70b GROQ_API_KEY ou ChatGoogleGenerativeAI gemini-2.5-flash gemini-3-flash-preview GOOGLE_API_KEY
+    model: "gemini-2.0-flash", // Ou ChatGroq llama-3.1-70b GROQ_API_KEY ou ChatGoogleGenerativeAI gemini-2.5-flash gemini-3-flash-preview GOOGLE_API_KEY
     cache: new InMemoryCache(),
     temperature: 0, // 0 = plus précis, 1 = plus créatif
     apiKey: process.env.GOOGLE_API_KEY,
@@ -177,6 +177,14 @@ export async function traiterMessage(messageUtilisateur: string): Promise<string
         await contextManager.addMessage(messageEntrant);
         const resultat = await graphe.invoke({ messages: [messageEntrant] }, { recursionLimit: 100 });
         const reponseFinale = resultat.messages.at(-1);
+        
+        // Si le dernier message est un ToolMessage contenant une image (data URL), on le renvoie directement
+        if (reponseFinale instanceof ToolMessage && 
+            typeof reponseFinale.content === 'string' && 
+            reponseFinale.content.startsWith('data:image')) {
+            return reponseFinale.content;
+        }
+        
         let contenu = String(reponseFinale?.content ?? "Pas de réponse.");
         if (!contenu.trim()) {
             contenu = "[L'agent n'a pas généré de réponse textuelle. Il a peut-être utilisé des outils.]";
