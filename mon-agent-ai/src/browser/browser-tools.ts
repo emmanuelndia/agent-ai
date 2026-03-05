@@ -208,7 +208,6 @@ export const screenshot = tool(
     schema: z.object({
       nom: z.string().optional().describe("Nom du fichier sans extension (optionnel)"),
     }),
-     returnDirect: true,
   }
 );
 
