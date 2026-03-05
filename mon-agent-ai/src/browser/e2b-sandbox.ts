@@ -21,7 +21,7 @@ export class E2BSandbox {
       // Création de la sandbox (utilise E2B_API_KEY de .env)
       this.sandbox = await Sandbox.create();
 
-      const headless = options?.headless ?? false;
+      const headless = options?.headless ?? true;
 
       // Étape 1: Installer Playwright si nécessaire (subprocess pour shell-like)
       const installCode = `

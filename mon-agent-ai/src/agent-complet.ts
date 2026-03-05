@@ -34,11 +34,11 @@ const contextConfig: ContextConfig = {
 const TOUS_LES_TOOLS = [...outilsDeBase, /* ...browserTools,  */...e2bTools, ...credentialTools, ...debugTools];
 
 // Le cerveau de l'agent (Google Generative AI)
-const llm = new ChatGroq({
-    model: "llama-3.3-70b-versatile", // Ou ChatGroq llama-3.1-70b GROQ_API_KEY ou ChatGoogleGenerativeAI gemini-2.5-flash gemini-3-flash-preview GOOGLE_API_KEY
+const llm = new ChatGoogleGenerativeAI({
+    model: "gemini-3-flash-preview", //  ChatGroq llama-3.3-70b-versatilegemini GROQ_API_KEY ou ChatGoogleGenerativeAI gemini-2.5-flash gemini-3-flash-preview GOOGLE_API_KEY
     cache: new InMemoryCache(),
     temperature: 0, // 0 = plus précis, 1 = plus créatif
-    apiKey: process.env.GROQ_API_KEY,
+    apiKey: process.env.GOOGLE_API_KEY,
     maxRetries: 5,
 }).bindTools(TOUS_LES_TOOLS);
 
