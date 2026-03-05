@@ -20,7 +20,7 @@ async function loadAgent() {
     const agent = await import('./agent-complet.js');
     traiterMessage = agent.traiterMessage;
     contextManager = agent.contextManager;
-    agentReady = true;
+    agentReady = true;  
     console.log("✅ Logique IA chargée avec succès");
   } catch (err) {
     console.error("❌ Erreur chargement IA:", err);
