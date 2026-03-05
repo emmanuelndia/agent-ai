@@ -114,6 +114,7 @@ export const screenshotE2B = tool(
         schema: z.object({
             nom: z.string().optional().describe("Nom du fichier sans extension"),
         }),
+        returnDirect: true,   // ← Ajoutez cette ligne
     }
 );
 
