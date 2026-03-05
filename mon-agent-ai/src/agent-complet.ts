@@ -154,6 +154,18 @@ function decider(etat: typeof EtatAgent.State): string {
     return END;
 }
 
+function afterTools(etat: typeof EtatAgent.State): string {
+    const dernierMessage = etat.messages.at(-1);
+    // Si le dernier message est un ToolMessage contenant une image, on termine
+    if (dernierMessage instanceof ToolMessage && 
+        typeof dernierMessage.content === 'string' && 
+        dernierMessage.content.startsWith('data:image')) {
+        console.log("afterTools - image détectée, fin du graphe");
+        return END;
+    }
+    // Sinon, on retourne au LLM
+    return "llm";
+}
 
 
 
@@ -163,7 +175,8 @@ const graphe = new StateGraph(EtatAgent)
     .addNode("tools", toolNode)
     .addEdge(START, "llm")
     .addConditionalEdges("llm", decider)
-    .addEdge("tools", "llm")
+    // .addEdge("tools", "llm")  // ← à supprimer
+    .addConditionalEdges("tools", afterTools)  // ← nouvelle arête
     .compile();
 
 
