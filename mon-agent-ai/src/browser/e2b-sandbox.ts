@@ -209,19 +209,16 @@ await type_text()
     if (!this.sandbox) return "❌ Sandbox non initialisée";
 
     try {
-      const filename = nom ? `${nom}.png` : `screenshot_${Date.now()}.png`;
-      const filepath = path.join(this.screenshotsDir, filename);
-
       const code = `
-import asyncio
-import base64
+  import asyncio
+  import base64
 
-async def take_screenshot():
-    screenshot_bytes = await page.screenshot()
-    print(base64.b64encode(screenshot_bytes).decode())
+  async def take_screenshot():
+      screenshot_bytes = await page.screenshot()
+      print(base64.b64encode(screenshot_bytes).decode())
 
-await take_screenshot()
-`;
+  await take_screenshot()
+  `;
 
       const result = await this.sandbox.runCode(code);
       if (result.error) {
@@ -233,10 +230,8 @@ await take_screenshot()
         return "❌ Aucune donnée reçue pour le screenshot";
       }
 
-      const imageBuffer = Buffer.from(base64Data, 'base64');
-      fs.writeFileSync(filepath, imageBuffer);
-
-      return `✅ Screenshot sauvegardé : ${filepath}`;
+      // Retourner directement l'image sous forme de data URL
+      return `data:image/png;base64,${base64Data}`;
     } catch (e) {
       return `❌ Erreur screenshot : ${(e as Error).message}`;
     }
