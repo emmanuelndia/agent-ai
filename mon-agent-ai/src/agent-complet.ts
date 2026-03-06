@@ -76,6 +76,12 @@ function classifierErreur(error: any): ErrorKind {
         return "QUOTA_EXHAUSTED";
     }
 
+    // Mistral : "tool call id has to be defined" après sanitisation = skip
+    // (ne devrait plus arriver après sanitiserMessages, mais sécurité supplémentaire)
+    if (msg.includes("tool call id has to be defined")) {
+        return "RETRYABLE"; // On retente après sanitisation
+    }
+
     return "FATAL";
 }
 
@@ -457,6 +463,71 @@ function construireSystemePrompt(): string {
     return SYSTEME_PROMPT_BASE + chargerInstructionsMemoire();
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SANITISATION DES MESSAGES POUR MISTRAL ET AUTRES PROVIDERS STRICTS
+//
+// Mistral exige que chaque ToolMessage ait un tool_call_id correspondant
+// à un tool_call dans l'AIMessage précédent. Si le contexte contient des
+// ToolMessages "orphelins" (sans leur AIMessage parent), Mistral refuse.
+//
+// Solution : nettoyer les messages avant de les envoyer à un provider strict.
+//   - Supprimer les ToolMessages sans AIMessage parent avec tool_calls
+//   - Supprimer les AIMessages avec tool_calls sans ToolMessages suivants
+// ─────────────────────────────────────────────────────────────────────────────
+
+function sanitiserMessages(messages: BaseMessage[]): BaseMessage[] {
+    const result: BaseMessage[] = [];
+
+    for (let i = 0; i < messages.length; i++) {
+        const msg = messages[i];
+
+        // Si c'est un ToolMessage, vérifier qu'il y a un AIMessage avec tool_calls juste avant
+        if (msg instanceof ToolMessage) {
+            const precedent = result.at(-1);
+            const parentAI  = precedent instanceof AIMessage &&
+                (
+                    (precedent.tool_calls?.length ?? 0) > 0 ||
+                    (precedent.additional_kwargs?.tool_calls as any[])?.length > 0
+                );
+            if (!parentAI) {
+                console.warn(`⚠️  Sanitise : ToolMessage orphelin ignoré (tool_call_id: ${msg.tool_call_id})`);
+                continue; // Skip ce ToolMessage orphelin
+            }
+            // Vérifier que le tool_call_id est défini
+            if (!msg.tool_call_id) {
+                console.warn(`⚠️  Sanitise : ToolMessage sans tool_call_id ignoré`);
+                continue;
+            }
+        }
+
+        result.push(msg);
+    }
+
+    // 2ème passe : retirer les AIMessages avec tool_calls qui ne sont pas suivis de ToolMessages
+    const result2: BaseMessage[] = [];
+    for (let i = 0; i < result.length; i++) {
+        const msg  = result[i];
+        const next = result[i + 1];
+
+        const hasToolCalls =
+            (msg instanceof AIMessage) &&
+            (
+                (msg.tool_calls?.length ?? 0) > 0 ||
+                (msg.additional_kwargs?.tool_calls as any[])?.length > 0
+            );
+
+        if (hasToolCalls && !(next instanceof ToolMessage)) {
+            console.warn(`⚠️  Sanitise : AIMessage avec tool_calls sans ToolMessage suivant ignoré`);
+            continue;
+        }
+
+        result2.push(msg);
+    }
+
+    return result2;
+}
+
 // GRAPHE LANGGRAPH
 
 const EtatAgent = Annotation.Root({
@@ -488,7 +559,10 @@ async function noeudLLM(etat: typeof EtatAgent.State) {
             `compression : ${((1 - stats.compressionRatio) * 100).toFixed(0)}%`
         );
 
-        const reponse = await multiLLM.invoke(allMessages);
+        // Nettoyer les messages pour les providers stricts (Mistral, Cohere)
+        // Supprime les ToolMessages orphelins et AIMessages sans réponse outil
+        const messagesSanitises = sanitiserMessages(allMessages);
+        const reponse = await multiLLM.invoke(messagesSanitises);
         console.log("Reponse LLM recue.");
 
         // Détection réponse vide : pas de texte ET pas de tool calls
@@ -511,7 +585,7 @@ async function noeudLLM(etat: typeof EtatAgent.State) {
                     "Commence maintenant par l'action la plus logique."
                 ),
             ];
-            const reponseNudge = await multiLLM.invoke(messagesAvecNudge);
+            const reponseNudge = await multiLLM.invoke(sanitiserMessages(messagesAvecNudge));
             console.log("Réponse après nudge reçue.");
             return { messages: [reponseNudge] };
         }
