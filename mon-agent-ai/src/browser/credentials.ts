@@ -4,6 +4,8 @@ import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
 
+const opt = <T extends z.ZodTypeAny>(s: T) => s.optional().nullable();
+
 // TYPES
 interface Credential {
     id: string; 
@@ -137,8 +139,8 @@ export const sauvegarderCredential = tool(
             url: z.string().describe("URL de la page de connexion"),
             email: z.string().describe("Email ou nom d'utilisateur"),
             motDePasse: z.string().describe("Mot de passe utilisé"),
-            nom: z.string().optional().describe("Nom affiché / pseudo sur le site"),
-            notes: z.string().optional().describe("Notes additionnelles"),
+            nom: opt(z.string()).describe("Nom affiché / pseudo sur le site"),
+            notes: opt(z.string()).describe("Notes additionnelles"),
         }),    
     }
 );
@@ -162,7 +164,7 @@ export const lireCredential = tool(
         description: "Récupère les identifiants suavegardés pour un site",
         schema: z.object({
             site: z.string().describe("Nom ou URL du site"),
-            email: z.string().optional().describe("Email spécifique si plusieurs comptes"),
+            email: opt(z.string()).describe("Email spécifique si plusieurs comptes"),
         }),
     }
 );

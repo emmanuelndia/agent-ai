@@ -1,8 +1,10 @@
 import { ChatGroq } from "@langchain/groq";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 import { ChatMistralAI } from "@langchain/mistralai";
-import { ChatOpenAI } from "@langchain/openai";
+import { ChatOpenAI } from "@langchain/openai";   // ← Cerebras via wrapper OpenAI-compatible
 import { ChatCohere } from "@langchain/cohere";
+// ChatCerebras (@langchain/cerebras) SUPPRIMÉ : incompatible avec @langchain/core@0.3.x
+// Cerebras est utilisé via ChatOpenAI avec baseURL custom (zéro conflit de dépendance)
 import { StateGraph, Annotation, END, START } from "@langchain/langgraph";
 import { ToolNode } from "@langchain/langgraph/prebuilt";
 import { HumanMessage, AIMessage, BaseMessage, ToolMessage } from "@langchain/core/messages";
@@ -58,6 +60,11 @@ function classifierErreur(error: any): ErrorKind {
         msg.includes("unavailable")
     ) return "RETRYABLE";
 
+    // 404 = modèle introuvable sur ce provider → passer au suivant
+    if (status === 404 || msg.includes("model_not_found") || msg.includes("no body")) {
+        return "QUOTA_EXHAUSTED";
+    }
+
     return "FATAL";
 }
 
@@ -92,7 +99,22 @@ interface ProviderConfig {
     factory: (tools: any[]) => any;
 }
 
-
+/**
+ * Chaîne de fallback — 7 providers, 7 quotas indépendants.
+ *
+ * ┌──────────────────────────────┬──────┬──────────────┬─────────────────────┐
+ * │ Provider / Modèle            │ RPM  │ Req/jour     │ Notes               │
+ * ├──────────────────────────────┼──────┼──────────────┼─────────────────────┤
+ * │ Gemini 2.0 Flash             │  55  │    1 500     │ Meilleur pour agent │
+ * │ Cerebras llama-3.3-70b       │  28  │  illimité    │ Via wrapper OpenAI  │
+ * │ Groq llama-3.3-70b           │  25  │   14 400     │                     │
+ * │ Cohere command-r             │  20  │    1 000     │                     │
+ * │ Groq llama-3.1-8b            │  25  │   14 400 *   │ Quota séparé        │
+ * │ Gemini 2.5 Flash             │   9  │      500 *   │ Quota séparé        │
+ * │ Mistral small                │   4  │  illimité    │ 1 Md tokens/mois    │
+ * │ Gemini gemini-3-flash-preview│   9  │      500 *   │ Dernier recours     │
+ * └──────────────────────────────┴──────┴──────────────┴─────────────────────┘
+ */
 const PROVIDERS_CHAIN: ProviderConfig[] = [
     // ── 1. Gemini 2.0 Flash — meilleur pour l'agentic (60 RPM)
     {
@@ -106,6 +128,10 @@ const PROVIDERS_CHAIN: ProviderConfig[] = [
             maxRetries: 0,
         }).bindTools(tools),
     },
+
+    // ── 2. Cerebras llama-3.3-70b — quota illimité, ultra-rapide
+    //       Utilise ChatOpenAI avec baseURL custom : zéro conflit de dépendance,
+    //       car @langchain/cerebras@1.0.x est incompatible avec @langchain/core@0.3.x
     {
         name: "Cerebras llama-3.3-70b",
         rpm: 28,
@@ -118,7 +144,10 @@ const PROVIDERS_CHAIN: ProviderConfig[] = [
                 baseURL: "https://api.cerebras.ai/v1",
             },
             maxRetries: 0,
-        }).bindTools(tools),
+        // strict: false — désactive la validation Zod stricte d'OpenAI
+        // Nécessaire car Cerebras n'impose pas le mode "structured outputs"
+        // et nos tools utilisent .optional() sans .nullable()
+        }).bindTools(tools, { strict: false }),
     },
 
     // ── 3. Groq llama-3.3-70b — 14 400 req/jour, très capable
