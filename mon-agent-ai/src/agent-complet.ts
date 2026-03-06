@@ -484,6 +484,32 @@ async function noeudLLM(etat: typeof EtatAgent.State) {
 
         const reponse = await multiLLM.invoke(allMessages);
         console.log("Reponse LLM recue.");
+
+        // Détection réponse vide : pas de texte ET pas de tool calls
+        // Cause : Gemini 2.5 Flash peut retourner un message vide si le contexte
+        // contient des messages d'une session précédente qui le perturbent.
+        // Solution : relancer avec un message de nudge qui force l'action.
+        const texte = String(reponse.content ?? "").trim();
+        const aDesTools =
+            (reponse.tool_calls?.length > 0) ||
+            (reponse.additional_kwargs?.tool_calls?.length > 0);
+
+        if (!texte && !aDesTools) {
+            console.warn("⚠️  Réponse vide détectée — relance avec nudge...");
+            const messagesAvecNudge = [
+                ...allMessages,
+                reponse,
+                new HumanMessage(
+                    "Ta réponse était vide. Rappel : tu dois OBLIGATOIREMENT utiliser " +
+                    "les outils disponibles pour répondre à la demande. " +
+                    "Commence maintenant par l'action la plus logique."
+                ),
+            ];
+            const reponseNudge = await multiLLM.invoke(messagesAvecNudge);
+            console.log("Réponse après nudge reçue.");
+            return { messages: [reponseNudge] };
+        }
+
         return { messages: [reponse] };
 
     } catch (error: any) {
@@ -513,7 +539,13 @@ function decider(etat: typeof EtatAgent.State): string {
             (dernierMessage as any).kwargs.tool_calls.length > 0);
 
     if (hasToolCalls) { console.log("decider -> tools"); return "tools"; }
-    console.log("decider -> END");
+
+    const texte = String(dernierMessage?.content ?? "").trim();
+    if (!texte) {
+        console.warn("⚠️  decider -> END (réponse vide, nudge non résolu)");
+    } else {
+        console.log("decider -> END");
+    }
     return END;
 }
 
