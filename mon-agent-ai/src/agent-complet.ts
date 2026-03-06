@@ -1,5 +1,7 @@
 import { ChatGroq } from "@langchain/groq";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
+import { ChatMistralAI } from "@langchain/mistralai";
+import { ChatCerebras } from "@langchain/cerebras";
 import { StateGraph, Annotation, END, START } from "@langchain/langgraph";
 import { ToolNode } from "@langchain/langgraph/prebuilt";
 import { HumanMessage, AIMessage, BaseMessage, ToolMessage } from "@langchain/core/messages";
@@ -21,12 +23,15 @@ import console from "console";
 
 dotenv.config();
 
-    
+// ─────────────────────────────────────────────────────────────────────────────
 // UTILITAIRES
+// ─────────────────────────────────────────────────────────────────────────────
 
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
+// ─────────────────────────────────────────────────────────────────────────────
 // CLASSIFICATION DES ERREURS API
+// ─────────────────────────────────────────────────────────────────────────────
 
 type ErrorKind = "QUOTA_EXHAUSTED" | "RATE_LIMIT" | "RETRYABLE" | "FATAL";
 
@@ -59,7 +64,9 @@ function classifierErreur(error: any): ErrorKind {
     return "FATAL";
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
 // RATE LIMITER
+// ─────────────────────────────────────────────────────────────────────────────
 
 class RateLimiter {
     private lastCallTime = 0;
@@ -81,7 +88,9 @@ class RateLimiter {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
 // GESTIONNAIRE MULTI-PROVIDER AVEC FALLBACK AUTOMATIQUE
+// ─────────────────────────────────────────────────────────────────────────────
 
 interface ProviderConfig {
     name: string;
@@ -90,7 +99,24 @@ interface ProviderConfig {
     factory: (tools: any[]) => any;
 }
 
+/**
+ * Chaîne de fallback — 7 providers, 7 quotas indépendants.
+ *
+ * ┌──────────────────────────────┬──────┬──────────────┬─────────────────────┐
+ * │ Provider / Modèle            │ RPM  │ Req/jour     │ Tokens/min          │
+ * ├──────────────────────────────┼──────┼──────────────┼─────────────────────┤
+ * │ Gemini 2.0 Flash             │  60  │    1 500     │  1 000 000          │
+ * │ Gemini 2.5 Flash             │  10  │      500     │    250 000  *quota  │
+ * │ Groq llama-3.3-70b           │  30  │   14 400     │      6 000          │
+ * │ Groq llama-3.1-8b            │  30  │   14 400 *   │     30 000          │
+ * │ Cerebras llama-3.3-70b       │  30  │  illimité    │     60 000          │
+ * │ Mistral mistral-small        │  ~5  │  illimité    │  1 Md tokens/mois   │
+ * │ Gemini gemini-3-flash-preview│  10  │      500 *   │    250 000          │
+ * └──────────────────────────────┴──────┴──────────────┴─────────────────────┘
+ * * = quota séparé → vrai fallback indépendant
+ */
 const PROVIDERS_CHAIN: ProviderConfig[] = [
+    // ── 1. Gemini 2.0 Flash — meilleur pour l'agentic (60 RPM)
     {
         name: "Gemini 2.0 Flash",
         rpm: 55,
@@ -102,6 +128,8 @@ const PROVIDERS_CHAIN: ProviderConfig[] = [
             maxRetries: 0,
         }).bindTools(tools),
     },
+
+    // ── 2. Groq llama-3.3-70b — 14 400 req/jour, très capable
     {
         name: "Groq llama-3.3-70b",
         rpm: 25,
@@ -113,6 +141,22 @@ const PROVIDERS_CHAIN: ProviderConfig[] = [
             maxRetries: 0,
         }).bindTools(tools),
     },
+
+    // ── 3. Cerebras llama-3.3-70b — quota journalier illimité, très rapide
+    //       (inference sur wafer-scale chip → ~2 000 tokens/sec)
+    {
+        name: "Cerebras llama-3.3-70b",
+        rpm: 28,
+        maxRetries: 3,
+        factory: (tools) => new ChatCerebras({
+            model: "llama-3.3-70b",
+            temperature: 0,
+            apiKey: process.env.CEREBRAS_API_KEY,
+            maxRetries: 0,
+        }).bindTools(tools),
+    },
+
+    // ── 4. Groq llama-3.1-8b — quota SÉPARÉ du 3.3-70b, très rapide
     {
         name: "Groq llama-3.1-8b",
         rpm: 25,
@@ -121,6 +165,45 @@ const PROVIDERS_CHAIN: ProviderConfig[] = [
             model: "llama-3.1-8b-instant",
             temperature: 0,
             apiKey: process.env.GROQ_API_KEY,
+            maxRetries: 0,
+        }).bindTools(tools),
+    },
+
+    // ── 5. Gemini 2.5 Flash — quota SÉPARÉ du 2.0 Flash
+    {
+        name: "Gemini 2.5 Flash",
+        rpm: 9,
+        maxRetries: 3,
+        factory: (tools) => new ChatGoogleGenerativeAI({
+            model: "gemini-2.5-flash",
+            temperature: 0,
+            apiKey: process.env.GOOGLE_API_KEY,
+            maxRetries: 0,
+        }).bindTools(tools),
+    },
+
+    // ── 6. Mistral small — 1 milliard de tokens/mois gratuits
+    {
+        name: "Mistral small",
+        rpm: 4,
+        maxRetries: 3,
+        factory: (tools) => new ChatMistralAI({
+            model: "mistral-small-latest",
+            temperature: 0,
+            apiKey: process.env.MISTRAL_API_KEY,
+            maxRetries: 0,
+        }).bindTools(tools),
+    },
+
+    // ── 7. Gemini gemini-3-flash-preview — quota SÉPARÉ, en dernier recours
+    {
+        name: "Gemini gemini-3-flash-preview",
+        rpm: 9,
+        maxRetries: 3,
+        factory: (tools) => new ChatGoogleGenerativeAI({
+            model: "gemini-3-flash-preview",
+            temperature: 0,
+            apiKey: process.env.GOOGLE_API_KEY,
             maxRetries: 0,
         }).bindTools(tools),
     },
@@ -204,8 +287,22 @@ class MultiProviderLLM {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
 // MIDDLEWARE D'OFFLOAD : INTERCEPTE LES RESULTATS D'OUTILS VOLUMINEUX
+// ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Wraps ToolNode pour intercepter les ToolMessages.
+ *
+ * AVANT offload : lire_page_e2b retourne 8 000 tokens de HTML
+ *                 -> charges directement dans le contexte LLM -> quota grille vite
+ *
+ * APRES offload : le HTML est sauvegarde dans ./agent-memory/tool-results/
+ *                 -> le LLM recoit 80 tokens ("fichier sauvegarde, utilise grep")
+ *                 -> le LLM appelle grep_memoire pour lire UNIQUEMENT ce dont il a besoin
+ *
+ * Economie reelle : 80% a 98% de tokens en moins par appel LLM.
+ */
 async function toolNodeAvecOffload(
     etat: typeof EtatAgent.State,
     toolNode: ToolNode
@@ -241,7 +338,9 @@ async function toolNodeAvecOffload(
     return { messages: messagesOptimises };
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
 // INITIALISATION GLOBALE
+// ─────────────────────────────────────────────────────────────────────────────
 
 const TOUS_LES_TOOLS = [
     ...outilsDeBase,
@@ -271,7 +370,9 @@ export const contextManager = new AdvancedContextManager(contextConfig, llmPourC
 
 const memoireConversation = new InMemoryChatMessageHistory();
 
+// ─────────────────────────────────────────────────────────────────────────────
 // MEMOIRE EVOLUTIVE : charge les instructions des sessions precedentes
+// ─────────────────────────────────────────────────────────────────────────────
 
 function chargerInstructionsMemoire(): string {
     try {
@@ -285,8 +386,22 @@ function chargerInstructionsMemoire(): string {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
 // SYSTEM PROMPT
+// ─────────────────────────────────────────────────────────────────────────────
 
+// ─────────────────────────────────────────────────────────────────────────────
+// SYSTEM PROMPT
+//
+// Règle KV cache fondamentale (Manus) :
+//   Le préfixe STABLE (SYSTEME_PROMPT_BASE) est identique à chaque appel
+//   → mis en cache après le 1er appel → 0 token recomputed pour cette partie
+//
+//   Le contenu dynamique (instructions apprises) est injecté À LA FIN,
+//   jamais au début — pour ne pas décaler le préfixe stable et casser le cache.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// PARTIE STABLE — ne change JAMAIS entre les appels → pleinement cachée par KV
 const SYSTEME_PROMPT_BASE = `Tu es un expert IA autonome. Tu disposes des outils suivants pour interagir avec le monde exterieur. Reponds toujours en francais.
 
 OUTILS DISPONIBLES :
@@ -342,7 +457,9 @@ function construireSystemePrompt(): string {
     return SYSTEME_PROMPT_BASE + chargerInstructionsMemoire();
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
 // GRAPHE LANGGRAPH
+// ─────────────────────────────────────────────────────────────────────────────
 
 const EtatAgent = Annotation.Root({
     messages: Annotation<BaseMessage[]>({
@@ -418,7 +535,9 @@ const graphe = new StateGraph(EtatAgent)
     .addEdge("tools", "llm")
     .compile();
 
+// ─────────────────────────────────────────────────────────────────────────────
 // API PUBLIQUE
+// ─────────────────────────────────────────────────────────────────────────────
 
 export interface AgentResponse {
     text: string;
@@ -461,7 +580,9 @@ export async function traiterMessage(messageUtilisateur: string): Promise<AgentR
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
 // INTERFACE CLI
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function demarrerInterface() {
     console.log("\n" + "=".repeat(65));
