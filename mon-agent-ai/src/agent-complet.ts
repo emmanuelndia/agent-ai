@@ -65,6 +65,12 @@ function classifierErreur(error: any): ErrorKind {
         return "QUOTA_EXHAUSTED";
     }
 
+    // 413 = requête trop grande pour ce modèle → passer au suivant
+    // (llama-3.1-8b a une petite fenêtre de contexte ~8K tokens)
+    if (status === 413 || msg.includes("request too large") || msg.includes("too large")) {
+        return "QUOTA_EXHAUSTED";
+    }
+
     // Cohere : "Missing required key type" = incompatibilité de schema → passer au suivant
     if (msg.includes("missing required key") || msg.includes("parameterdefinitions")) {
         return "QUOTA_EXHAUSTED";
