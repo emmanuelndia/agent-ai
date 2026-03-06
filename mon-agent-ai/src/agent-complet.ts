@@ -144,7 +144,7 @@ async function noeudLLM(etat: typeof EtatAgent.State) {
         const stats = contextManager.getContextStats();
         console.log(`📊 Contexte: ${stats.totalMessages} messages, ${stats.currentTokens} tokens, compression: ${(1 - stats.compressionRatio) * 100}%`);
         
-        await rateLimiter.wait();
+        await rateLimiter.wait(); 
         const reponse = await llm.invoke(allMessages);
         console.log("📤 Réponse LLM brute:", JSON.stringify(reponse, null, 2));
         return { messages: [reponse] };
