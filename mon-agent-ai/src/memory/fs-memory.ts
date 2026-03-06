@@ -277,8 +277,8 @@ export const rechercherGlob = tool(
             "Ex: pattern '*.txt' liste tous les fichiers texte, " +
             "'*navigation*' trouve les fichiers de navigation. " +
             "Dossiers disponibles : agent-memory/tool-results, agent-memory/plans, agent-memory/discoveries",
-        schema: opt(z.object({
-            dossier : z.string()).describe(`Dossier à lister (défaut: ${MEMORY_DIR})`),
+        schema: z.object({
+            dossier : opt(z.string()).describe(`Dossier à lister (défaut: ${MEMORY_DIR})`),
             pattern : opt(z.string()).describe("Filtre glob (ex: '*.txt', '*screenshot*', '2024*')"),
         }),
     }
