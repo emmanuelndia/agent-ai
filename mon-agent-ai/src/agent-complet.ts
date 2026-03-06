@@ -60,8 +60,13 @@ function classifierErreur(error: any): ErrorKind {
         msg.includes("unavailable")
     ) return "RETRYABLE";
 
-    // 404 = modèle introuvable sur ce provider → passer au suivant
+    // 404 = modèle introuvable → passer au suivant
     if (status === 404 || msg.includes("model_not_found") || msg.includes("no body")) {
+        return "QUOTA_EXHAUSTED";
+    }
+
+    // Cohere : "Missing required key type" = incompatibilité de schema → passer au suivant
+    if (msg.includes("missing required key") || msg.includes("parameterdefinitions")) {
         return "QUOTA_EXHAUSTED";
     }
 
@@ -173,7 +178,7 @@ const PROVIDERS_CHAIN: ProviderConfig[] = [
             temperature: 0,
             apiKey: process.env.COHERE_API_KEY,
             maxRetries: 0,
-        }).bindTools(tools),
+        }).bindTools(tools, { strict: false }),
     },
 
     // ── 5. Groq llama-3.1-8b — quota SÉPARÉ du 3.3-70b, très rapide

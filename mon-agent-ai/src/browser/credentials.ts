@@ -6,6 +6,8 @@ import * as crypto from "crypto";
 
 const opt = <T extends z.ZodTypeAny>(s: T) => s.optional().nullable();
 
+const opt = <T extends z.ZodTypeAny>(s: T) => s.optional().nullable();
+
 // TYPES
 interface Credential {
     id: string; 
@@ -195,7 +197,7 @@ export const generateMotDePasse = tool(
         description:
             "Génère un mot de passe fort et aléatoire. Génère toujours un MDP avant de créer un compte.",
         schema: z.object({
-            longueur: z.number().int().min(8).max(64).default(16),
+            longueur: opt(z.number().int().min(8).max(64)).default(16),
         }),
     }
 );

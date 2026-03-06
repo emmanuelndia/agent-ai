@@ -1,5 +1,7 @@
 import { tool } from "@langchain/core/tools";
 import { date, z } from "zod";
+
+const opt = <T extends z.ZodTypeAny>(s: T) => s.optional().nullable();
 import * as fs from "fs";
 import * as path from "path";
 
@@ -78,8 +80,7 @@ export const ecrireFichier = tool(
         schema: z.object({
             chemin: z.string().describe("Chemin du fichier à créer/modifier"),
             contenu: z.string().describe("Contenu à écrire"),
-            mode: z
-                .enum(["write", "append"])
+            mode: opt(z.enum(["write", "append"]))
                 .default("write")
                 .describe("'write' = écrase, 'append' = ajoute à la fin"),
         }),
@@ -111,7 +112,7 @@ export const listerFichiers = tool(
         name: "lister_fichiers",
         description: "Liste les fichiers et dossiers dans le répertoire. Utilise './screenshots' pour le dossier screenshots.",
         schema: z.object({
-            dossier: z.string().default(".").describe("Chemin du dossier à lister (ex: './screenshots')"),
+            dossier: opt(z.string()).default(".").describe("Chemin du dossier à lister (ex: './screenshots')"),
         }),
     }
 );
