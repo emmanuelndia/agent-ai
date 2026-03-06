@@ -1,7 +1,8 @@
 import { ChatGroq } from "@langchain/groq";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 import { ChatMistralAI } from "@langchain/mistralai";
-import { ChatCerebras } from "@langchain/cerebras";
+import { ChatOpenAI } from "@langchain/openai";
+import { ChatCohere } from "@langchain/cohere";
 import { StateGraph, Annotation, END, START } from "@langchain/langgraph";
 import { ToolNode } from "@langchain/langgraph/prebuilt";
 import { HumanMessage, AIMessage, BaseMessage, ToolMessage } from "@langchain/core/messages";
@@ -105,8 +106,22 @@ const PROVIDERS_CHAIN: ProviderConfig[] = [
             maxRetries: 0,
         }).bindTools(tools),
     },
+    {
+        name: "Cerebras llama-3.3-70b",
+        rpm: 28,
+        maxRetries: 3,
+        factory: (tools) => new ChatOpenAI({
+            model: "llama-3.3-70b",
+            temperature: 0,
+            apiKey: process.env.CEREBRAS_API_KEY,
+            configuration: {
+                baseURL: "https://api.cerebras.ai/v1",
+            },
+            maxRetries: 0,
+        }).bindTools(tools),
+    },
 
-    // ── 2. Groq llama-3.3-70b — 14 400 req/jour, très capable
+    // ── 3. Groq llama-3.3-70b — 14 400 req/jour, très capable
     {
         name: "Groq llama-3.3-70b",
         rpm: 25,
@@ -119,21 +134,20 @@ const PROVIDERS_CHAIN: ProviderConfig[] = [
         }).bindTools(tools),
     },
 
-    // ── 3. Cerebras llama-3.3-70b — quota journalier illimité, très rapide
-    //       (inference sur wafer-scale chip → ~2 000 tokens/sec)
+    // ── 4. Cohere command-r
     {
-        name: "Cerebras llama-3.3-70b",
-        rpm: 28,
+        name: "Cohere command-r",
+        rpm: 20,
         maxRetries: 3,
-        factory: (tools) => new ChatCerebras({
-            model: "llama-3.3-70b",
+        factory: (tools) => new ChatCohere({
+            model: "command-r",
             temperature: 0,
-            apiKey: process.env.CEREBRAS_API_KEY,
+            apiKey: process.env.COHERE_API_KEY,
             maxRetries: 0,
         }).bindTools(tools),
     },
 
-    // ── 4. Groq llama-3.1-8b — quota SÉPARÉ du 3.3-70b, très rapide
+    // ── 5. Groq llama-3.1-8b — quota SÉPARÉ du 3.3-70b, très rapide
     {
         name: "Groq llama-3.1-8b",
         rpm: 25,
@@ -146,7 +160,7 @@ const PROVIDERS_CHAIN: ProviderConfig[] = [
         }).bindTools(tools),
     },
 
-    // ── 5. Gemini 2.5 Flash — quota SÉPARÉ du 2.0 Flash
+    // ── 6. Gemini 2.5 Flash — quota SÉPARÉ du 2.0 Flash
     {
         name: "Gemini 2.5 Flash",
         rpm: 9,
@@ -159,7 +173,7 @@ const PROVIDERS_CHAIN: ProviderConfig[] = [
         }).bindTools(tools),
     },
 
-    // ── 6. Mistral small — 1 milliard de tokens/mois gratuits
+    // ── 7. Mistral small — 1 milliard de tokens/mois gratuits
     {
         name: "Mistral small",
         rpm: 4,
@@ -172,7 +186,7 @@ const PROVIDERS_CHAIN: ProviderConfig[] = [
         }).bindTools(tools),
     },
 
-    // ── 7. Gemini gemini-3-flash-preview — quota SÉPARÉ, en dernier recours
+    // ── 8. Gemini gemini-3-flash-preview — quota SÉPARÉ, en dernier recours
     {
         name: "Gemini gemini-3-flash-preview",
         rpm: 9,
@@ -266,18 +280,6 @@ class MultiProviderLLM {
 
 // MIDDLEWARE D'OFFLOAD : INTERCEPTE LES RESULTATS D'OUTILS VOLUMINEUX
 
-/**
- * Wraps ToolNode pour intercepter les ToolMessages.
- *
- * AVANT offload : lire_page_e2b retourne 8 000 tokens de HTML
- *                 -> charges directement dans le contexte LLM -> quota grille vite
- *
- * APRES offload : le HTML est sauvegarde dans ./agent-memory/tool-results/
- *                 -> le LLM recoit 80 tokens ("fichier sauvegarde, utilise grep")
- *                 -> le LLM appelle grep_memoire pour lire UNIQUEMENT ce dont il a besoin
- *
- * Economie reelle : 80% a 98% de tokens en moins par appel LLM.
- */
 async function toolNodeAvecOffload(
     etat: typeof EtatAgent.State,
     toolNode: ToolNode
@@ -288,7 +290,6 @@ async function toolNodeAvecOffload(
         if (!(msg instanceof ToolMessage)) return msg;
         if (typeof msg.content !== "string") return msg;
 
-        // Ces outils ne doivent PAS etre offloades (base64 screenshot, reponses courtes)
         const outilsExclus = ["screenshot_e2b", "obtenir_date", "calculer",
                               "grep_memoire", "lire_lignes", "resume_session",
                               "mettre_a_jour_todo", "lire_todo", "lire_instructions"];
@@ -343,7 +344,7 @@ export const contextManager = new AdvancedContextManager(contextConfig, llmPourC
 
 const memoireConversation = new InMemoryChatMessageHistory();
 
-// MEMOIRE EVOLUTIVE : charge les instructions des sessions precedentes
+// MEMOIRE EVOLUTIVE
 
 function chargerInstructionsMemoire(): string {
     try {
@@ -358,18 +359,9 @@ function chargerInstructionsMemoire(): string {
 }
 
 // SYSTEM PROMPT
+// Règle KV cache : préfixe STABLE identique à chaque appel → pleinement caché.
+// Contenu dynamique (instructions apprises) injecté À LA FIN uniquement.
 
-// SYSTEM PROMPT
-//
-// Règle KV cache fondamentale (Manus) :
-//   Le préfixe STABLE (SYSTEME_PROMPT_BASE) est identique à chaque appel
-//   → mis en cache après le 1er appel → 0 token recomputed pour cette partie
-//
-//   Le contenu dynamique (instructions apprises) est injecté À LA FIN,
-//   jamais au début — pour ne pas décaler le préfixe stable et casser le cache.
-// ─────────────────────────────────────────────────────────────────────────────
-
-// PARTIE STABLE — ne change JAMAIS entre les appels → pleinement cachée par KV
 const SYSTEME_PROMPT_BASE = `Tu es un expert IA autonome. Tu disposes des outils suivants pour interagir avec le monde exterieur. Reponds toujours en francais.
 
 OUTILS DISPONIBLES :
@@ -463,8 +455,6 @@ async function noeudLLM(etat: typeof EtatAgent.State) {
     } catch (error: any) {
         console.error("Erreur definitive noeudLLM:", error?.message);
         // PRINCIPE MANUS : garder les erreurs dans le contexte.
-        // L'erreur complete met a jour les croyances du modele et evite
-        // qu'il repete la meme action qui a echoue.
         const isQuotaEpuise = error?.message?.includes("Tous les providers");
         const messageErreur = isQuotaEpuise
             ? "ERREUR QUOTA : Tous les providers LLM sont epuises. Attendre demain."
@@ -552,7 +542,7 @@ async function demarrerInterface() {
     console.log("=".repeat(65));
     console.log("Providers (fallback automatique) :");
     PROVIDERS_CHAIN.forEach((p, i) =>
-        console.log(`  ${i + 1}. ${p.name.padEnd(22)} ${p.rpm} req/min`)
+        console.log(`  ${i + 1}. ${p.name.padEnd(26)} ${p.rpm} req/min`)
     );
     console.log("FS-Memory : ./agent-memory/ (offload auto des gros resultats)");
     console.log("-".repeat(65));
