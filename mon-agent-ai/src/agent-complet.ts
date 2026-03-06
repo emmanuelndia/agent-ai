@@ -10,7 +10,7 @@ import { browserTools } from "./browser/browser-tools";
 import { e2bTools } from "./browser/e2b-tools";
 import { credentialTools } from "./browser/credentials";
 import { debugTools } from "./browser/debug-tools";
-import { fsMemoryTools, offloadSiVolumineux, INSTRUCTIONS_FILE } from "./memory/fs-memory";
+import { fsMemoryTools, offloadSiVolumineux, INSTRUCTIONS_FILE, TODO_FILE } from "./memory/fs-memory";
 import { navigateur } from "./browser/browser-manager";
 import { e2bSandbox } from "./browser/e2b-sandbox";
 import { AdvancedContextManager, ContextConfig } from "./context/context-manager";
@@ -21,6 +21,7 @@ import console from "console";
 
 dotenv.config();
 
+    
 // UTILITAIRES
 
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
@@ -102,22 +103,11 @@ const PROVIDERS_CHAIN: ProviderConfig[] = [
         }).bindTools(tools),
     },
     {
-        name: "Gemini 3 Flash Preview",
-        rpm: 55,
+        name: "Gemini 1.5 Flash",
+        rpm: 12,
         maxRetries: 3,
         factory: (tools) => new ChatGoogleGenerativeAI({
-            model: "gemini-3-flash-preview",
-            temperature: 0,
-            apiKey: process.env.GOOGLE_API_KEY,
-            maxRetries: 0,
-        }).bindTools(tools),
-    },
-    {
-        name: "Gemini 2.5 Flash",
-        rpm: 55,
-        maxRetries: 3,
-        factory: (tools) => new ChatGoogleGenerativeAI({
-            model: "gemini-2.5-flash",
+            model: "gemini-1.5-flash",
             temperature: 0,
             apiKey: process.env.GOOGLE_API_KEY,
             maxRetries: 0,
@@ -227,18 +217,6 @@ class MultiProviderLLM {
 
 // MIDDLEWARE D'OFFLOAD : INTERCEPTE LES RESULTATS D'OUTILS VOLUMINEUX
 
-/**
- * Wraps ToolNode pour intercepter les ToolMessages.
- *
- * AVANT offload : lire_page_e2b retourne 8 000 tokens de HTML
- *                 -> charges directement dans le contexte LLM -> quota grille vite
- *
- * APRES offload : le HTML est sauvegarde dans ./agent-memory/tool-results/
- *                 -> le LLM recoit 80 tokens ("fichier sauvegarde, utilise grep")
- *                 -> le LLM appelle grep_memoire pour lire UNIQUEMENT ce dont il a besoin
- *
- * Economie reelle : 80% a 98% de tokens en moins par appel LLM.
- */
 async function toolNodeAvecOffload(
     etat: typeof EtatAgent.State,
     toolNode: ToolNode
@@ -251,7 +229,8 @@ async function toolNodeAvecOffload(
 
         // Ces outils ne doivent PAS etre offloades (base64 screenshot, reponses courtes)
         const outilsExclus = ["screenshot_e2b", "obtenir_date", "calculer",
-                              "grep_memoire", "lire_lignes", "resume_session"];
+                              "grep_memoire", "lire_lignes", "resume_session",
+                              "mettre_a_jour_todo", "lire_todo", "lire_instructions"];
         if (outilsExclus.some(nom => msg.name?.includes(nom))) return msg;
 
         const contenuOptimise = offloadSiVolumineux(msg.name ?? "tool", msg.content);
@@ -342,6 +321,8 @@ FS-Memory (PRIORITAIRE pour les grands resultats) :
   - rechercher_glob    : lister les fichiers par pattern
   - ecrire_decouverte  : sauvegarder une info importante trouvee
   - ecrire_plan        : sauvegarder un plan avant une tache complexe
+  - mettre_a_jour_todo : mettre a jour la todo-list de la tache en cours
+  - lire_todo          : lire la todo-list courante
   - apprendre_instruction : memoriser une instruction de l'utilisateur
   - lire_instructions  : charger les instructions des sessions precedentes
   - resume_session     : voir tous les fichiers crees dans la session
@@ -349,16 +330,20 @@ FS-Memory (PRIORITAIRE pour les grands resultats) :
 REGLE FONDAMENTALE - GESTION DU CONTEXTE :
 Quand un outil retourne un resultat volumineux (page HTML, longue liste), il est
 AUTOMATIQUEMENT sauvegarde dans ./agent-memory/tool-results/ et tu recois un message
-court avec le chemin. Dans ce cas, utilise grep_memoire ou lire_lignes pour extraire
-UNIQUEMENT les informations dont tu as besoin. Ne recharge jamais tout le fichier.
+court avec le chemin. Utilise grep_memoire ou lire_lignes pour extraire
+UNIQUEMENT les informations dont tu as besoin.
 
 REGLES D'OR :
-1. Pour toute tache complexe (navigation + formulaire), commence par ecrire_plan.
-2. Quand tu trouves une info importante (selecteur CSS, URL, structure), utilise ecrire_decouverte.
-3. Apres une creation de compte, sauvegarde toujours les identifiants avec sauvegarder_credential.
-4. Si l'utilisateur te donne un conseil, utilise apprendre_instruction pour le memoriser.
-5. Prends un screenshot avant/apres chaque action cle pour verifier.
-6. Utilise attendre_e2b pour laisser le temps aux elements d'apparaitre.
+1. TOUTE tache complexe commence par mettre_a_jour_todo (plan initial).
+2. Apres CHAQUE etape terminee, appelle mettre_a_jour_todo pour cocher l'etape.
+   Cela recite tes objectifs en fin de contexte et evite la derive.
+3. Quand tu trouves une info importante (selecteur CSS, URL), utilise ecrire_decouverte.
+4. Apres une creation de compte, sauvegarde les identifiants avec sauvegarder_credential.
+5. Si tu rencontres une erreur, NOTE-LA dans le todo (champ note de l'etape).
+   Ne cache jamais une erreur — elle met a jour tes croyances et evite la repetition.
+6. Si l'utilisateur te donne un conseil, utilise apprendre_instruction.
+7. Prends un screenshot avant/apres chaque action cle.
+8. Utilise attendre_e2b pour laisser le temps aux elements d'apparaitre.
 
 SELECTEURS COURANTS :
 - Google : 'input[name="q"]', 'textarea[name="q"]'
@@ -405,10 +390,15 @@ async function noeudLLM(etat: typeof EtatAgent.State) {
 
     } catch (error: any) {
         console.error("Erreur definitive noeudLLM:", error?.message);
-        const message = error?.message?.includes("Tous les providers")
-            ? "Tous les quotas API sont epuises. Reessaie demain ou active la facturation."
-            : `Une erreur technique est survenue : ${error?.message ?? "inconnue"}`;
-        return { messages: [new AIMessage(message)] };
+        // PRINCIPE MANUS : garder les erreurs dans le contexte.
+        // L'erreur complete met a jour les croyances du modele et evite
+        // qu'il repete la meme action qui a echoue.
+        const isQuotaEpuise = error?.message?.includes("Tous les providers");
+        const messageErreur = isQuotaEpuise
+            ? "ERREUR QUOTA : Tous les providers LLM sont epuises. Attendre demain."
+            : `ERREUR TECHNIQUE [${error?.constructor?.name ?? "Error"}]: ${error?.message ?? "inconnue"}\n` +
+              `Stack: ${(error?.stack ?? "").split("\n").slice(0, 3).join(" | ")}`;
+        return { messages: [new AIMessage(messageErreur)] };
     }
 }
 

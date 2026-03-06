@@ -426,14 +426,90 @@ export const resumeSession = tool(
     }
 );
 
-// EXPORT
 
+
+
+// OUTIL TODO.MD — Manipulation de l'attention par récitation (principe Manus)
+
+
+export const TODO_FILE = path.join(MEMORY_DIR, "todo.md");
+
+export const mettreAJourTodo = tool(
+    async ({ tache, etapes }) => {
+        try {
+            // Structure déterministe — PAS de timestamp (tuerait le KV cache)
+            const contenu =
+                `# TODO — Tâche en cours\n\n` +
+                `**Objectif :** ${tache}\n\n` +
+                `## Étapes\n\n` +
+                etapes.map(e =>
+                    `- [${e.fait ? "x" : " "}] ${e.texte}` +
+                    (e.note ? ` ← ${e.note}` : "")
+                ).join("\n") +
+                "\n";
+
+            fs.writeFileSync(TODO_FILE, contenu, "utf-8");
+
+            const faites  = etapes.filter(e => e.fait).length;
+            const restant = etapes.filter(e => !e.fait).length;
+
+            // Retourner le todo complet — il sera lu par le LLM en fin de contexte
+            // → zone d'attention maximale → évite la dérive
+            return (
+                `✅ Todo mis à jour (${faites}/${etapes.length} faites, ${restant} restantes)\n\n` +
+                contenu
+            );
+        } catch (e) {
+            return `❌ Erreur todo : ${(e as Error).message}`;
+        }
+    },
+    {
+        name: "mettre_a_jour_todo",
+        description:
+            "Met à jour le fichier todo.md de la tâche en cours. " +
+            "OBLIGATOIRE au début de chaque tâche complexe et après chaque étape. " +
+            "Coche les étapes terminées, ajoute des notes sur les erreurs rencontrées. " +
+            "En récitant le plan à chaque tour, l'agent évite de perdre le fil sur les tâches longues.",
+        schema: z.object({
+            tache : z.string().describe("Objectif principal de la tâche"),
+            etapes: z.array(z.object({
+                texte: z.string().describe("Description de l'étape"),
+                fait : z.boolean().describe("true si l'étape est terminée"),
+                note : z.string().optional().describe("Note ou erreur rencontrée sur cette étape"),
+            })).describe("Liste complète des étapes (faites ET à faire)"),
+        }),
+    }
+);
+
+export const lireTodo = tool(
+    async () => {
+        try {
+            if (!fs.existsSync(TODO_FILE)) {
+                return "📋 Aucune tâche en cours. Utilise mettre_a_jour_todo pour en créer une.";
+            }
+            return `📋 Tâche en cours :\n\n${fs.readFileSync(TODO_FILE, "utf-8")}`;
+        } catch (e) {
+            return `❌ Erreur lecture todo : ${(e as Error).message}`;
+        }
+    },
+    {
+        name: "lire_todo",
+        description:
+            "Lit la todo-list de la tâche en cours. " +
+            "Utilise ce tool pour retrouver le plan si tu perds le fil.",
+        schema: z.object({}).optional(),
+    }
+);
+
+// Ajouter les nouveaux outils à l'export
 export const fsMemoryTools = [
     grepMemoire,
     lireLignes,
     rechercherGlob,
     ecrireDecouverte,
     ecrirePlan,
+    mettreAJourTodo,
+    lireTodo,
     apprendreInstruction,
     lireInstructions,
     resumeSession,

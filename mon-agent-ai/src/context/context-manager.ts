@@ -1,272 +1,314 @@
-import { BaseMessage, HumanMessage, AIMessage } from "@langchain/core/messages";
+import { BaseMessage, HumanMessage, AIMessage, SystemMessage } from "@langchain/core/messages";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 import { ChatGroq } from "@langchain/groq";
 import { InMemoryChatMessageHistory } from "@langchain/core/chat_history";
 import { getEncoding } from "js-tiktoken";
+import * as fs   from "fs";
+import * as path from "path";
+
+// TYPES
 
 export interface ContextWindow {
-  messages: BaseMessage[];
-  totalTokens: number;
-  maxTokens: number;  
-  summary?: string;
-  compressedMessages: BaseMessage[];
+    messages: BaseMessage[];
+    totalTokens: number;
+    maxTokens: number;
+    compressedMessages: BaseMessage[];
 }
 
 export interface ContextConfig {
-  maxTokens: number;
-  compressionThreshold: number;
-  summaryInterval: number;
-  keepLastNMessages: number;
+    maxTokens: number;
+    compressionThreshold: number;
+    summaryInterval: number;
+    keepLastNMessages: number;
+    summaryDir?: string;   // Dossier FS pour stocker les résumés compressés
 }
 
-// Initialisation de l'encodeur (en dehors de la classe pour ne le faire qu'une fois)
+// ENCODEUR (singleton)
+
 const encoder = getEncoding("cl100k_base");
 
+// ADVANCED CONTEXT MANAGER
+
 export class AdvancedContextManager {
-  private contextHistory: BaseMessage[] = [];
-  private summaries: string[] = [];
-  private currentWindow: ContextWindow;
-  private config: ContextConfig;
-  private llm: ChatGoogleGenerativeAI;
-  private messageHistory: InMemoryChatMessageHistory;
+    // Historique APPEND-ONLY — on n'efface jamais un élément
+    private contextHistory: BaseMessage[] = [];
 
-  constructor(config: Partial<ContextConfig> = {}, llmInstance?: ChatGoogleGenerativeAI) {
-    this.config = {
-      maxTokens: 32000, // Limite pour les modèles
-      compressionThreshold: 0.8, // Compresser à 80% de la limite
-      summaryInterval: 10, // Résumer toutes les 10 interactions
-      keepLastNMessages: 5, // Toujours garder les 5 derniers messages
-      ...config
-    };
+    // Résumés textuels (sans timestamp — déterministes)
+    private summaries: string[] = [];
 
-    // Utiliser l'instance LLM fournie ou en créer une selon la clé API disponible
-    if (!llmInstance) {
-      throw new Error("Aucun LLM fourni à AdvancedContextManager");
-    }
-    this.llm = llmInstance;
+    private currentWindow: ContextWindow;
+    private config: ContextConfig;
+    private llm: any;
+    private messageHistory: InMemoryChatMessageHistory;
 
-    this.messageHistory = new InMemoryChatMessageHistory();
-    
-    this.currentWindow = {
-      messages: [],
-      totalTokens: 0,
-      maxTokens: this.config.maxTokens,
-      compressedMessages: []
-    };
-  }
+    constructor(config: Partial<ContextConfig> = {}, llmInstance?: any) {
+        this.config = {
+            maxTokens: 32000,
+            compressionThreshold: 0.8,
+            summaryInterval: 10,
+            keepLastNMessages: 5,
+            summaryDir: "./agent-memory/summaries",
+            ...config,
+        };
 
-  /**
-   * Estime le nombre de tokens pour un message
-   */
-  private estimateTokens(message: BaseMessage | string): number {
-    let content = "";
-    
-    if (typeof message === "string") {
-      content = message;
-    } else {
-      // Gérer le contenu textuel du message
-      content = String(message.content);
-      
-      // OPTIMISATION : Si le message contient des images (multimodal), 
-      // il faut ajouter un forfait de tokens fixe (Gemini compte environ 258 tokens par image)
-      if (Array.isArray(message.content)) {
-        let total = 0;
-        for (const part of message.content) {
-          if (typeof part === 'object' && part !== null && 'type' in part) {
-            if (part.type === "text" && 'text' in part) {
-              total += encoder.encode(String(part.text)).length;
-            } else if (part.type === "image_url") {
-              total += 258; // Forfait standard pour Gemini
-            }
-          }
+        if (!llmInstance) throw new Error("Aucun LLM fourni à AdvancedContextManager");
+        this.llm = llmInstance;
+
+        this.messageHistory = new InMemoryChatMessageHistory();
+
+        this.currentWindow = {
+            messages: [],
+            totalTokens: 0,
+            maxTokens: this.config.maxTokens,
+            compressedMessages: [],
+        };
+
+        // Créer le dossier de résumés si nécessaire
+        if (this.config.summaryDir) {
+            fs.mkdirSync(this.config.summaryDir, { recursive: true });
         }
-        return total;
-      }
     }
 
-    // Encodage et comptage précis
-    const tokens = encoder.encode(content);
-    return tokens.length;
-  }
 
-  private calculateTotalTokens(messages: BaseMessage[]): number {
-    return messages.reduce((total, msg) => total + this.estimateTokens(msg), 0);
-  }
+    // ESTIMATION TOKENS
 
+    private estimateTokens(message: BaseMessage | string): number {
+        let content = "";
 
-  /**
-   * Ajoute un message au contexte avec gestion intelligente
-   */
-  async addMessage(message: BaseMessage): Promise<void> {
-    const tokens = this.estimateTokens(message);
-    
-    // Ajouter à l'historique complet
-    this.contextHistory.push(message);
-    await this.messageHistory.addMessage(message);
+        if (typeof message === "string") {
+            content = message;
+        } else {
+            content = String(message.content);
 
-    // Vérifier si nous dépassons la limite
-    if (this.currentWindow.totalTokens + tokens > this.config.maxTokens * this.config.compressionThreshold) {
-      await this.compressContext();
+            if (Array.isArray(message.content)) {
+                let total = 0;
+                for (const part of message.content) {
+                    if (typeof part === "object" && part !== null && "type" in part) {
+                        if (part.type === "text" && "text" in part) {
+                            total += encoder.encode(String(part.text)).length;
+                        } else if (part.type === "image_url") {
+                            total += 258;
+                        }
+                    }
+                }
+                return total;
+            }
+        }
+
+        return encoder.encode(content).length;
     }
 
-    // Ajouter le message
-    this.currentWindow.messages.push(message);
-    this.currentWindow.totalTokens += tokens;
+    // AJOUT DE MESSAGE (append-only)
 
-    // Résumé périodique
-    if (this.contextHistory.length % this.config.summaryInterval === 0) {
-      await this.generateSummary();
-    }
-  }
+    async addMessage(message: BaseMessage): Promise<void> {
+        const tokens = this.estimateTokens(message);
 
-  /**
-   * Compresse le contexte en résumant les anciens messages
-   */
-  private async compressContext(): Promise<void> {
-    const messagesToCompress = this.currentWindow.messages.slice(0, -this.config.keepLastNMessages);
-    const recentMessages = this.currentWindow.messages.slice(-this.config.keepLastNMessages);
+        // Append-only : on ajoute toujours, on ne modifie jamais
+        this.contextHistory.push(message);
+        await this.messageHistory.addMessage(message);
 
-    if (messagesToCompress.length === 0) return;
+        // Vérifier le seuil de compression
+        if (
+            this.currentWindow.totalTokens + tokens >
+            this.config.maxTokens * this.config.compressionThreshold
+        ) {
+            await this.compressContextViaFS();
+        }
 
-    const summaryPrompt = `Résume ces messages de conversation en conservant les informations importantes:
-${messagesToCompress.map(m => `${m.getType()}: ${m.content}`).join('\n')}
+        this.currentWindow.messages.push(message);
+        this.currentWindow.totalTokens += tokens;
 
-Résumé concis:`;
-
-    try {
-      const summaryResponse = await this.llm.invoke([
-        new HumanMessage(summaryPrompt)
-      ]);
-
-      const summary = String(summaryResponse.content);
-      this.summaries.push(summary);
-
-      // Recréer la fenêtre de contexte
-      this.currentWindow.messages = [
-        new HumanMessage(`[Résumé précédent]: ${summary}`),
-        ...recentMessages
-      ];
-
-      // Recalculer les tokens
-      this.currentWindow.totalTokens = this.currentWindow.messages.reduce(
-        (total, msg) => total + this.estimateTokens(msg), 0
-      );
-
-      console.log(`🔄 Contexte compressé: ${messagesToCompress.length} messages → 1 résumé (${this.currentWindow.totalTokens} tokens)`);
-    } catch (error) {
-      console.error("Erreur lors de la compression du contexte:", error);
-      // En cas d'erreur, garder seulement les messages récents
-      this.currentWindow.messages = recentMessages;
-      this.currentWindow.totalTokens = recentMessages.reduce(
-        (total, msg) => total + this.estimateTokens(msg), 0
-      );
-    }
-  }
-
-  /**
-   * Génère un résumé complet de la conversation
-   */
-  private async generateSummary(): Promise<void> {
-    if (this.contextHistory.length < 5) return;
-
-    const fullConversation = this.contextHistory
-      .slice(-20) // Derniers 20 messages
-      .map(m => `${m.getType()}: ${m.content}`)
-      .join('\n');
-
-    const summaryPrompt = `Génère un résumé structuré de cette conversation en identifiant:
-1. Les tâches accomplies
-2. Les informations importantes
-3. L'état actuel du travail
-4. Les prochaines étapes potentielles
-
-Conversation:
-${fullConversation}
-
-Résumé structuré:`;
-
-    try {
-      const response = await this.llm.invoke([new HumanMessage(summaryPrompt)]);
-      const summary = String(response.content);
-      
-      // Sauvegarder le résumé avec timestamp
-      const timestampedSummary = `[${new Date().toISOString()}] ${summary}`;
-      this.summaries.push(timestampedSummary);
-      
-      console.log(`📝 Nouveau résumé généré (${this.summaries.length} résumés totaux)`);
-    } catch (error) {
-      console.error("Erreur lors de la génération du résumé:", error);
-    }
-  }
-
-  /**
-   * Récupère le contexte optimisé pour le LLM
-   */
-  async getOptimizedContext(systemPrompt: string): Promise<BaseMessage[]> {
-    const context: BaseMessage[] = [new HumanMessage(systemPrompt)];
-
-    // Ajouter les résumés si disponibles
-    if (this.summaries.length > 0) {
-      const recentSummaries = this.summaries.slice(-2); // Derniers 2 résumés
-      context.push(new HumanMessage(`[Historique résumé]:\n${recentSummaries.join('\n')}`));
+        // Résumé périodique (sans consommer de tokens LLM si pas nécessaire)
+        if (this.contextHistory.length % this.config.summaryInterval === 0) {
+            await this.generateSummaryViaFS();
+        }
     }
 
-    // Ajouter les messages de la fenêtre actuelle
-    context.push(...this.currentWindow.messages);
+    // COMPRESSION VIA FS (remplace compressContext)
+    //
+    // Principe Manus : "la compression devient restaurable"
+    // On n'efface PAS les anciens messages — on les décharge dans un fichier
+    // et on garde un POINTEUR court dans le contexte.
+    //
+    // KV cache : les messages récents (keepLastNMessages) restent identiques
+    // d'un appel à l'autre → leur préfixe est toujours caché.
+  
+    private async compressContextViaFS(): Promise<void> {
+        const recent    = this.currentWindow.messages.slice(-this.config.keepLastNMessages);
+        const toCompress = this.currentWindow.messages.slice(0, -this.config.keepLastNMessages);
 
-    return context;
-  }
+        if (toCompress.length === 0) return;
 
-  /**
-   * Nettoie le contexte (reset)
-   */
-  async clearContext(): Promise<void> {
-    this.contextHistory = [];
-    this.summaries = [];
-    this.currentWindow = {
-      messages: [],
-      totalTokens: 0,
-      maxTokens: this.config.maxTokens,
-      compressedMessages: []
-    };
-    
-    await this.messageHistory.clear();
-    console.log("🧹 Contexte entièrement nettoyé");
-  }
+        // Générer un résumé textuel (SANS timestamp pour rester déterministe)
+        const summaryPrompt =
+            "Résume ces échanges de manière concise, en conservant :\n" +
+            "- Les actions effectuées et leurs résultats\n" +
+            "- Les informations importantes (URLs, sélecteurs, identifiants)\n" +
+            "- Les erreurs rencontrées et comment elles ont été résolues\n\n" +
+            toCompress.map(m => `${m.getType()}: ${String(m.content).slice(0, 500)}`).join("\n") +
+            "\n\nRésumé:";
 
-  /**
-   * Retourne des statistiques sur le contexte
-   */
-  getContextStats(): {
-    totalMessages: number;
-    currentTokens: number;
-    summariesCount: number;
-    compressionRatio: number;
-  } {
-    const originalTokens = this.contextHistory.reduce(
-      (total, msg) => total + this.estimateTokens(msg), 0
-    );
-    
-    return {
-      totalMessages: this.contextHistory.length,
-      currentTokens: this.currentWindow.totalTokens,
-      summariesCount: this.summaries.length,
-      compressionRatio: originalTokens > 0 ? this.currentWindow.totalTokens / originalTokens : 1
-    };
-  }
+        let summaryText = `[${toCompress.length} messages compressés]`;
 
-  /**
-   * Exporte le contexte complet pour debugging
-   */
-  exportFullContext(): {
-    messages: BaseMessage[];
-    summaries: string[];
-    stats: ReturnType<AdvancedContextManager['getContextStats']>;
-  } {
-    return {
-      messages: this.contextHistory,
-      summaries: this.summaries,
-      stats: this.getContextStats()
-    };
-  }
+        try {
+            const response = await this.llm.invoke([new HumanMessage(summaryPrompt)]);
+            summaryText = String(response.content);
+            this.summaries.push(summaryText);
+        } catch (err) {
+            console.warn("Compression LLM échouée, résumé minimal utilisé.");
+        }
+
+        // Sauvegarder le contenu complet dans un fichier FS (restaurable)
+        const fichierSummary = this.sauvegarderSummaryFS(toCompress, summaryText);
+
+        // Remplacer les anciens messages par UN SEUL message pointeur
+        // Ce pointeur est court (~30 tokens) et STABLE (déterministe)
+        const pointeur = new HumanMessage(
+            `[CONTEXTE COMPRESSÉ — ${toCompress.length} messages archivés dans ${fichierSummary}]\n` +
+            `Résumé : ${summaryText}`
+        );
+
+        // Reconstruire la fenêtre : pointeur + messages récents (append-like)
+        this.currentWindow.messages = [pointeur, ...recent];
+        this.currentWindow.totalTokens = this.currentWindow.messages.reduce(
+            (t, m) => t + this.estimateTokens(m), 0
+        );
+
+        console.log(
+            `🗜️  Compression FS : ${toCompress.length} msgs → 1 pointeur ` +
+            `(${this.currentWindow.totalTokens} tokens restants)`
+        );
+    }
+
+    private sauvegarderSummaryFS(messages: BaseMessage[], summary: string): string {
+        if (!this.config.summaryDir) return "mémoire";
+
+        // Nom de fichier DÉTERMINISTE (basé sur le nombre de messages, pas un timestamp)
+        // → même contenu = même nom → évite les doublons
+        const hash = messages.length + "-" + this.summaries.length;
+        const nomFichier = `summary-${hash}.md`;
+        const chemin = path.join(this.config.summaryDir, nomFichier);
+
+        const contenu =
+            `# Résumé compressé (${messages.length} messages)\n\n` +
+            `## Synthèse\n${summary}\n\n` +
+            `## Messages originaux\n\n` +
+            messages
+                .map(m => `### ${m.getType()}\n${String(m.content).slice(0, 2000)}`)
+                .join("\n\n");
+
+        fs.writeFileSync(chemin, contenu, "utf-8");
+        return chemin;
+    }
+
+    // RÉSUMÉ PÉRIODIQUE VIA FS (remplace generateSummary)
+    //
+    // Correction : suppression du timestamp dans le contenu du résumé.
+    // Un timestamp change à chaque appel → préfixe jamais identique → 0% cache hit.
+
+    private async generateSummaryViaFS(): Promise<void> {
+        if (this.contextHistory.length < 5) return;
+
+        const derniers = this.contextHistory
+            .slice(-20)
+            .map(m => `${m.getType()}: ${String(m.content).slice(0, 400)}`)
+            .join("\n");
+
+        const prompt =
+            "Génère un résumé structuré :\n" +
+            "1. Tâches accomplies\n" +
+            "2. Informations importantes\n" +
+            "3. État actuel\n" +
+            "4. Prochaines étapes\n\n" +
+            `Conversation:\n${derniers}\n\nRésumé:`;
+
+        try {
+            const response = await this.llm.invoke([new HumanMessage(prompt)]);
+            const summary  = String(response.content);
+
+            // PAS de timestamp — résumé pur et déterministe
+            this.summaries.push(summary);
+
+            console.log(`📝 Résumé périodique généré (total: ${this.summaries.length})`);
+        } catch (err) {
+            console.warn("Résumé périodique échoué (silencieux).");
+        }
+    }
+
+    // CONSTRUCTION DU CONTEXTE OPTIMISÉ
+    //
+    // Règle KV cache :
+    //   - Le system prompt (préfixe) doit être IDENTIQUE à chaque appel
+    //   - Les messages passés s'ACCUMULENT (append-only)
+    //   - Le contenu dynamique (résumés, état) va À LA FIN, pas au début
+    //
+    // Structure retournée :
+    //   [SystemMessage stable] → toujours caché après le 1er appel
+    //   [Résumés si dispo]     → stables entre les appels (pas de timestamp)
+    //   [Messages courants]    → s'allongent, préfixe croissant caché
+ 
+    async getOptimizedContext(systemPrompt: string): Promise<BaseMessage[]> {
+        const context: BaseMessage[] = [];
+
+        // 1. System prompt — STABLE, jamais modifié → pleinement caché par KV
+        //    Important : ne PAS injecter de contenu dynamique ici
+        context.push(new HumanMessage(systemPrompt));
+
+        // 2. Résumés si disponibles — ajoutés APRÈS le system prompt stable
+        //    Ils ne changent pas entre les tours → préfixe étendu caché
+        if (this.summaries.length > 0) {
+            const derniersSummaries = this.summaries.slice(-2).join("\n\n---\n\n");
+            context.push(
+                new HumanMessage(`[Résumés de session]\n${derniersSummaries}`)
+            );
+        }
+
+        // 3. Messages de la fenêtre courante (append-only)
+        context.push(...this.currentWindow.messages);
+
+        return context;
+    }
+
+    // UTILITAIRES PUBLICS
+
+    async clearContext(): Promise<void> {
+        this.contextHistory = [];
+        this.summaries = [];
+        this.currentWindow = {
+            messages: [],
+            totalTokens: 0,
+            maxTokens: this.config.maxTokens,
+            compressedMessages: [],
+        };
+        await this.messageHistory.clear();
+        console.log("🧹 Contexte entièrement nettoyé");
+    }
+
+    getContextStats(): {
+        totalMessages: number;
+        currentTokens: number;
+        summariesCount: number;
+        compressionRatio: number;
+    } {
+        const originalTokens = this.contextHistory.reduce(
+            (t, m) => t + this.estimateTokens(m), 0
+        );
+
+        return {
+            totalMessages   : this.contextHistory.length,
+            currentTokens   : this.currentWindow.totalTokens,
+            summariesCount  : this.summaries.length,
+            compressionRatio: originalTokens > 0
+                ? this.currentWindow.totalTokens / originalTokens
+                : 1,
+        };
+    }
+
+    exportFullContext() {
+        return {
+            messages : this.contextHistory,
+            summaries: this.summaries,
+            stats    : this.getContextStats(),
+        };
+    }
 }
