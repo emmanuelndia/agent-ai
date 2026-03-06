@@ -23,15 +23,11 @@ import console from "console";
 
 dotenv.config();
 
-// ─────────────────────────────────────────────────────────────────────────────
 // UTILITAIRES
-// ─────────────────────────────────────────────────────────────────────────────
 
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
-// ─────────────────────────────────────────────────────────────────────────────
 // CLASSIFICATION DES ERREURS API
-// ─────────────────────────────────────────────────────────────────────────────
 
 type ErrorKind = "QUOTA_EXHAUSTED" | "RATE_LIMIT" | "RETRYABLE" | "FATAL";
 
@@ -64,9 +60,7 @@ function classifierErreur(error: any): ErrorKind {
     return "FATAL";
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // RATE LIMITER
-// ─────────────────────────────────────────────────────────────────────────────
 
 class RateLimiter {
     private lastCallTime = 0;
@@ -88,9 +82,7 @@ class RateLimiter {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // GESTIONNAIRE MULTI-PROVIDER AVEC FALLBACK AUTOMATIQUE
-// ─────────────────────────────────────────────────────────────────────────────
 
 interface ProviderConfig {
     name: string;
@@ -272,9 +264,7 @@ class MultiProviderLLM {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // MIDDLEWARE D'OFFLOAD : INTERCEPTE LES RESULTATS D'OUTILS VOLUMINEUX
-// ─────────────────────────────────────────────────────────────────────────────
 
 /**
  * Wraps ToolNode pour intercepter les ToolMessages.
@@ -323,9 +313,7 @@ async function toolNodeAvecOffload(
     return { messages: messagesOptimises };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // INITIALISATION GLOBALE
-// ─────────────────────────────────────────────────────────────────────────────
 
 const TOUS_LES_TOOLS = [
     ...outilsDeBase,
@@ -355,9 +343,7 @@ export const contextManager = new AdvancedContextManager(contextConfig, llmPourC
 
 const memoireConversation = new InMemoryChatMessageHistory();
 
-// ─────────────────────────────────────────────────────────────────────────────
 // MEMOIRE EVOLUTIVE : charge les instructions des sessions precedentes
-// ─────────────────────────────────────────────────────────────────────────────
 
 function chargerInstructionsMemoire(): string {
     try {
@@ -371,11 +357,8 @@ function chargerInstructionsMemoire(): string {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // SYSTEM PROMPT
-// ─────────────────────────────────────────────────────────────────────────────
 
-// ─────────────────────────────────────────────────────────────────────────────
 // SYSTEM PROMPT
 //
 // Règle KV cache fondamentale (Manus) :
@@ -442,9 +425,7 @@ function construireSystemePrompt(): string {
     return SYSTEME_PROMPT_BASE + chargerInstructionsMemoire();
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // GRAPHE LANGGRAPH
-// ─────────────────────────────────────────────────────────────────────────────
 
 const EtatAgent = Annotation.Root({
     messages: Annotation<BaseMessage[]>({
@@ -520,9 +501,7 @@ const graphe = new StateGraph(EtatAgent)
     .addEdge("tools", "llm")
     .compile();
 
-// ─────────────────────────────────────────────────────────────────────────────
 // API PUBLIQUE
-// ─────────────────────────────────────────────────────────────────────────────
 
 export interface AgentResponse {
     text: string;
@@ -565,9 +544,7 @@ export async function traiterMessage(messageUtilisateur: string): Promise<AgentR
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // INTERFACE CLI
-// ─────────────────────────────────────────────────────────────────────────────
 
 async function demarrerInterface() {
     console.log("\n" + "=".repeat(65));
