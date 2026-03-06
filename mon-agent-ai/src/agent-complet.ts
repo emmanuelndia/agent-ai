@@ -99,22 +99,7 @@ interface ProviderConfig {
     factory: (tools: any[]) => any;
 }
 
-/**
- * Chaîne de fallback — 7 providers, 7 quotas indépendants.
- *
- * ┌──────────────────────────────┬──────┬──────────────┬─────────────────────┐
- * │ Provider / Modèle            │ RPM  │ Req/jour     │ Tokens/min          │
- * ├──────────────────────────────┼──────┼──────────────┼─────────────────────┤
- * │ Gemini 2.0 Flash             │  60  │    1 500     │  1 000 000          │
- * │ Gemini 2.5 Flash             │  10  │      500     │    250 000  *quota  │
- * │ Groq llama-3.3-70b           │  30  │   14 400     │      6 000          │
- * │ Groq llama-3.1-8b            │  30  │   14 400 *   │     30 000          │
- * │ Cerebras llama-3.3-70b       │  30  │  illimité    │     60 000          │
- * │ Mistral mistral-small        │  ~5  │  illimité    │  1 Md tokens/mois   │
- * │ Gemini gemini-3-flash-preview│  10  │      500 *   │    250 000          │
- * └──────────────────────────────┴──────┴──────────────┴─────────────────────┘
- * * = quota séparé → vrai fallback indépendant
- */
+
 const PROVIDERS_CHAIN: ProviderConfig[] = [
     // ── 1. Gemini 2.0 Flash — meilleur pour l'agentic (60 RPM)
     {
