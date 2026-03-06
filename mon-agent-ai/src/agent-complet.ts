@@ -103,17 +103,6 @@ const PROVIDERS_CHAIN: ProviderConfig[] = [
         }).bindTools(tools),
     },
     {
-        name: "Gemini 1.5 Flash",
-        rpm: 12,
-        maxRetries: 3,
-        factory: (tools) => new ChatGoogleGenerativeAI({
-            model: "gemini-1.5-flash",
-            temperature: 0,
-            apiKey: process.env.GOOGLE_API_KEY,
-            maxRetries: 0,
-        }).bindTools(tools),
-    },
-    {
         name: "Groq llama-3.3-70b",
         rpm: 25,
         maxRetries: 3,
