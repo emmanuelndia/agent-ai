@@ -10,132 +10,256 @@ import { browserTools } from "./browser/browser-tools";
 import { e2bTools } from "./browser/e2b-tools";
 import { credentialTools } from "./browser/credentials";
 import { debugTools } from "./browser/debug-tools";
+import { fsMemoryTools, offloadSiVolumineux, INSTRUCTIONS_FILE } from "./memory/fs-memory";
 import { navigateur } from "./browser/browser-manager";
 import { e2bSandbox } from "./browser/e2b-sandbox";
 import { AdvancedContextManager, ContextConfig } from "./context/context-manager";
-import { ContextStrategyFactory, ContextStrategy } from "./context/context-strategies";
+import * as fs from "fs";
 import * as readline from "readline";
 import * as dotenv from "dotenv";
 import console from "console";
 
 dotenv.config();
 
-// UTILITAIRES RATE LIMIT
+// UTILITAIRES
 
-/** Pause asynchrone */
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
-/**
- * Rate Limiter — garantit un délai minimum entre chaque appel LLM.
- * Empêche de dépasser la limite de requêtes par minute des APIs gratuites.
- *
- *   Gemini 2.0 Flash (gratuit) : 60 RPM  → utiliser RateLimiter(55)
- *   Groq llama-3.1-8b-instant  : 30 RPM  → utiliser RateLimiter(25)
- *   Groq llama-3.3-70b         : 30 RPM  → utiliser RateLimiter(25)
- */
+// CLASSIFICATION DES ERREURS API
+
+type ErrorKind = "QUOTA_EXHAUSTED" | "RATE_LIMIT" | "RETRYABLE" | "FATAL";
+
+function classifierErreur(error: any): ErrorKind {
+    const msg    = (error?.message ?? "").toLowerCase();
+    const status = error?.status ?? 0;
+
+    if (
+        msg.includes("limit: 0") ||
+        msg.includes("per_day") ||
+        (msg.includes("quota") && msg.includes("exceeded") && msg.includes("day"))
+    ) return "QUOTA_EXHAUSTED";
+
+    if (
+        status === 429 ||
+        msg.includes("rate_limit") ||
+        msg.includes("rate limit") ||
+        msg.includes("too many requests") ||
+        msg.includes("resource_exhausted") ||
+        (msg.includes("quota") && msg.includes("exceeded") && !msg.includes("day"))
+    ) return "RATE_LIMIT";
+
+    if (
+        status === 503 ||
+        msg.includes("overloaded") ||
+        msg.includes("timeout") ||
+        msg.includes("unavailable")
+    ) return "RETRYABLE";
+
+    return "FATAL";
+}
+
+// RATE LIMITER
+
 class RateLimiter {
     private lastCallTime = 0;
     private readonly minDelay: number;
 
     constructor(requestsPerMinute: number) {
-        // On prend une marge de sécurité de 10 % sur la limite déclarée
         this.minDelay = (60 / requestsPerMinute) * 1000;
     }
 
     async wait(): Promise<void> {
-        const now = Date.now();
+        const now     = Date.now();
         const elapsed = now - this.lastCallTime;
         if (elapsed < this.minDelay) {
             const waitMs = this.minDelay - elapsed;
-            console.log(`🕒 Rate limiter : pause de ${Math.round(waitMs)}ms avant le prochain appel LLM…`);
+            console.log(`🕒 Rate limiter : pause ${Math.round(waitMs)}ms...`);
             await sleep(waitMs);
         }
         this.lastCallTime = Date.now();
     }
 }
 
-/**
- * Retry avec backoff exponentiel — gère les erreurs 429 (rate limit) et
- * les erreurs réseau temporaires retournées par Groq / Gemini.
- *
- * Délais : 2s → 4s → 8s → 16s → 32s (max 5 tentatives)
- */
-async function invokeWithRetry(
-    llm: ReturnType<typeof creerLLM>,
-    messages: BaseMessage[],
-    maxRetries = 5
-): Promise<any> {
-    for (let attempt = 0; attempt < maxRetries; attempt++) {
-        try {
-            return await (llm as any).invoke(messages);
-        } catch (error: any) {
-            const isRateLimit =
-                error?.status === 429 ||
-                error?.code === "rate_limit_exceeded" ||
-                error?.message?.toLowerCase().includes("rate_limit") ||
-                error?.message?.toLowerCase().includes("rate limit") ||
-                error?.message?.toLowerCase().includes("quota") ||
-                error?.message?.toLowerCase().includes("too many requests") ||
-                error?.message?.toLowerCase().includes("resource_exhausted");
+// GESTIONNAIRE MULTI-PROVIDER AVEC FALLBACK AUTOMATIQUE
 
-            const isRetryable =
-                isRateLimit ||
-                error?.status === 503 ||
-                error?.message?.toLowerCase().includes("overloaded") ||
-                error?.message?.toLowerCase().includes("timeout");
-
-            if (isRetryable && attempt < maxRetries - 1) {
-                // Backoff exponentiel : 2s, 4s, 8s, 16s, 32s
-                const waitSec = Math.pow(2, attempt + 1);
-                console.warn(
-                    `⚠️  ${isRateLimit ? "Rate limit" : "Erreur temporaire"} détecté(e). ` +
-                    `Tentative ${attempt + 1}/${maxRetries} — attente ${waitSec}s…`
-                );
-                await sleep(waitSec * 1000);
-                continue;
-            }
-
-            // Erreur non-récupérable ou tentatives épuisées
-            throw error;
-        }
-    }
+interface ProviderConfig {
+    name: string;
+    rpm: number;
+    maxRetries: number;
+    factory: (tools: any[]) => any;
 }
 
-// CONFIGURATION DU MODÈLE LLM (via variables d'environnement)
-
-function creerLLM() {
-    const provider     = process.env.LLM_PROVIDER    ?? "gemini";
-    const maxRetries   = parseInt(process.env.LLM_MAX_RETRIES ?? "5");
-
-    if (provider === "groq") {
-        const model = process.env.LLM_MODEL ?? "llama-3.1-8b-instant";
-        console.log(`🤖 LLM : Groq — ${model}`);
-        return new ChatGroq({
-            model,
-            cache: new InMemoryCache(),
+const PROVIDERS_CHAIN: ProviderConfig[] = [
+    {
+        name: "Gemini 2.0 Flash",
+        rpm: 55,
+        maxRetries: 3,
+        factory: (tools) => new ChatGoogleGenerativeAI({
+            model: "gemini-2.0-flash",
+            temperature: 0,
+            apiKey: process.env.GOOGLE_API_KEY,
+            maxRetries: 0,
+        }).bindTools(tools),
+    },
+    {
+        name: "Gemini 1.5 Flash",
+        rpm: 12,
+        maxRetries: 3,
+        factory: (tools) => new ChatGoogleGenerativeAI({
+            model: "gemini-1.5-flash",
+            temperature: 0,
+            apiKey: process.env.GOOGLE_API_KEY,
+            maxRetries: 0,
+        }).bindTools(tools),
+    },
+    {
+        name: "Groq llama-3.3-70b",
+        rpm: 25,
+        maxRetries: 3,
+        factory: (tools) => new ChatGroq({
+            model: "llama-3.3-70b-versatile",
             temperature: 0,
             apiKey: process.env.GROQ_API_KEY,
-            maxRetries: 0,   // On gère les retries manuellement avec invokeWithRetry
-        });
+            maxRetries: 0,
+        }).bindTools(tools),
+    },
+    {
+        name: "Groq llama-3.1-8b",
+        rpm: 25,
+        maxRetries: 3,
+        factory: (tools) => new ChatGroq({
+            model: "llama-3.1-8b-instant",
+            temperature: 0,
+            apiKey: process.env.GROQ_API_KEY,
+            maxRetries: 0,
+        }).bindTools(tools),
+    },
+];
+
+class MultiProviderLLM {
+    private currentIndex = 0;
+    private rateLimiters = new Map<number, RateLimiter>();
+    private instances    = new Map<number, any>();
+    private tools: any[];
+
+    constructor(tools: any[]) {
+        this.tools = tools;
+        PROVIDERS_CHAIN.forEach((p, i) =>
+            this.rateLimiters.set(i, new RateLimiter(p.rpm))
+        );
     }
 
-    // Défaut : Gemini (60 RPM sur le tier gratuit)
-    const model = process.env.LLM_MODEL ?? "gemini-2.0-flash";
-    console.log(`🤖 LLM : Gemini — ${model}`);
-    return new ChatGoogleGenerativeAI({
-        model,
-        cache: new InMemoryCache(),
-        temperature: 0,
-        apiKey: process.env.GOOGLE_API_KEY,
-        maxRetries: 0,   // On gère les retries manuellement avec invokeWithRetry
-    });
+    private getInstance(index: number): any {
+        if (!this.instances.has(index)) {
+            console.log(`Initialisation provider : ${PROVIDERS_CHAIN[index].name}`);
+            this.instances.set(index, PROVIDERS_CHAIN[index].factory(this.tools));
+        }
+        return this.instances.get(index)!;
+    }
+
+    getCurrentProviderName(): string {
+        return PROVIDERS_CHAIN[this.currentIndex]?.name ?? "Aucun";
+    }
+
+    async invoke(messages: BaseMessage[]): Promise<any> {
+        while (this.currentIndex < PROVIDERS_CHAIN.length) {
+            const config  = PROVIDERS_CHAIN[this.currentIndex];
+            const limiter = this.rateLimiters.get(this.currentIndex)!;
+            const llm     = this.getInstance(this.currentIndex);
+
+            for (let attempt = 0; attempt < config.maxRetries; attempt++) {
+                try {
+                    await limiter.wait();
+                    console.log(`[${config.name}] tentative ${attempt + 1}/${config.maxRetries}`);
+                    return await llm.invoke(messages);
+                } catch (error: any) {
+                    const kind = classifierErreur(error);
+                    console.warn(`[${config.name}] ${kind} : ${String(error?.message).slice(0, 120)}`);
+
+                    switch (kind) {
+                        case "QUOTA_EXHAUSTED":
+                            console.warn(`Quota epuise sur [${config.name}] -> provider suivant...`);
+                            attempt = config.maxRetries;
+                            break;
+                        case "RATE_LIMIT": {
+                            const match   = error?.message?.match(/retry.*?(\d+(?:\.\d+)?)\s*s/i);
+                            const suggest = match ? parseFloat(match[1]) * 1000 : 0;
+                            const waitMs  = Math.max(suggest, Math.pow(2, attempt + 1) * 1000);
+                            console.warn(`Rate limit - attente ${Math.round(waitMs / 1000)}s...`);
+                            await sleep(waitMs);
+                            break;
+                        }
+                        case "RETRYABLE": {
+                            const waitMs = Math.pow(2, attempt + 1) * 1000;
+                            console.warn(`Erreur temporaire - attente ${Math.round(waitMs / 1000)}s...`);
+                            await sleep(waitMs);
+                            break;
+                        }
+                        case "FATAL":
+                            throw error;
+                    }
+                }
+            }
+
+            this.currentIndex++;
+            if (this.currentIndex < PROVIDERS_CHAIN.length) {
+                console.log(`Nouveau provider : ${PROVIDERS_CHAIN[this.currentIndex].name}`);
+            }
+        }
+
+        throw new Error(
+            "Tous les providers LLM ont atteint leur quota journalier. " +
+            "Reessaie demain ou active la facturation sur une cle API."
+        );
+    }
 }
 
-// Déduire le RPM cible selon le provider (peut être surchargé via LLM_RPM)
-function getRPM(): number {
-    if (process.env.LLM_RPM) return parseInt(process.env.LLM_RPM);
-    const provider = process.env.LLM_PROVIDER ?? "gemini";
-    return provider === "groq" ? 25 : 55; // marge de sécurité sur les limites
+// MIDDLEWARE D'OFFLOAD : INTERCEPTE LES RESULTATS D'OUTILS VOLUMINEUX
+
+/**
+ * Wraps ToolNode pour intercepter les ToolMessages.
+ *
+ * AVANT offload : lire_page_e2b retourne 8 000 tokens de HTML
+ *                 -> charges directement dans le contexte LLM -> quota grille vite
+ *
+ * APRES offload : le HTML est sauvegarde dans ./agent-memory/tool-results/
+ *                 -> le LLM recoit 80 tokens ("fichier sauvegarde, utilise grep")
+ *                 -> le LLM appelle grep_memoire pour lire UNIQUEMENT ce dont il a besoin
+ *
+ * Economie reelle : 80% a 98% de tokens en moins par appel LLM.
+ */
+async function toolNodeAvecOffload(
+    etat: typeof EtatAgent.State,
+    toolNode: ToolNode
+): Promise<{ messages: BaseMessage[] }> {
+    const resultat = await toolNode.invoke(etat);
+
+    const messagesOptimises = resultat.messages.map((msg: BaseMessage) => {
+        if (!(msg instanceof ToolMessage)) return msg;
+        if (typeof msg.content !== "string") return msg;
+
+        // Ces outils ne doivent PAS etre offloades (base64 screenshot, reponses courtes)
+        const outilsExclus = ["screenshot_e2b", "obtenir_date", "calculer",
+                              "grep_memoire", "lire_lignes", "resume_session"];
+        if (outilsExclus.some(nom => msg.name?.includes(nom))) return msg;
+
+        const contenuOptimise = offloadSiVolumineux(msg.name ?? "tool", msg.content);
+
+        if (contenuOptimise !== msg.content) {
+            const ratio = Math.round(
+                ((msg.content.length - contenuOptimise.length) / msg.content.length) * 100
+            );
+            console.log(`Offload FS : ${msg.name} | ${msg.content.length} -> ${contenuOptimise.length} chars (-${ratio}% tokens)`);
+        }
+
+        return new ToolMessage({
+            content     : contenuOptimise,
+            tool_call_id: msg.tool_call_id,
+            name        : msg.name,
+        });
+    });
+
+    return { messages: messagesOptimises };
 }
 
 // INITIALISATION GLOBALE
@@ -146,67 +270,92 @@ const TOUS_LES_TOOLS = [
     ...e2bTools,
     ...credentialTools,
     ...debugTools,
+    ...fsMemoryTools,
 ];
 
-const llmBase   = creerLLM();
-const llm       = (llmBase as any).bindTools(TOUS_LES_TOOLS);
-const rateLimiter = new RateLimiter(getRPM());
+const multiLLM = new MultiProviderLLM(TOUS_LES_TOOLS);
 
-const MAX_RETRIES = parseInt(process.env.LLM_MAX_RETRIES ?? "5");
+const llmPourContexte = new ChatGoogleGenerativeAI({
+    model: "gemini-2.0-flash",
+    temperature: 0,
+    apiKey: process.env.GOOGLE_API_KEY,
+    maxRetries: 2,
+}) as any;
 
-// Gestionnaire de contexte
 const contextConfig: ContextConfig = {
     maxTokens: 28000,
     compressionThreshold: 0.75,
     summaryInterval: 8,
     keepLastNMessages: 6,
 };
-export const contextManager = new AdvancedContextManager(contextConfig, llmBase as any);
+export const contextManager = new AdvancedContextManager(contextConfig, llmPourContexte);
 
-// Mémoire conservée pour compatibilité avec la CLI
 const memoireConversation = new InMemoryChatMessageHistory();
+
+// MEMOIRE EVOLUTIVE : charge les instructions des sessions precedentes
+
+function chargerInstructionsMemoire(): string {
+    try {
+        if (!fs.existsSync(INSTRUCTIONS_FILE)) return "";
+        const contenu = fs.readFileSync(INSTRUCTIONS_FILE, "utf-8").trim();
+        if (contenu.length < 80) return "";
+        console.log(`Instructions memorisees chargees (${contenu.length} chars)`);
+        return "\n\n[INSTRUCTIONS MEMORISEES DES SESSIONS PRECEDENTES]\n" + contenu;
+    } catch {
+        return "";
+    }
+}
 
 // SYSTEM PROMPT
 
-const SYSTEME_PROMPT = `Tu es un expert IA autonome. Tu disposes des outils suivants pour interagir avec le monde extérieur. Réponds toujours en français.
+const SYSTEME_PROMPT_BASE = `Tu es un expert IA autonome. Tu disposes des outils suivants pour interagir avec le monde exterieur. Reponds toujours en francais.
 
 OUTILS DISPONIBLES :
-- demarrer_sandbox : Démarre une sandbox E2B avec un navigateur. À utiliser lorsque l'utilisateur demande d'ouvrir un navigateur, d'aller sur Internet, de lancer Chrome, etc.
-- aller_vers_e2b : Navigue vers une URL (ex: "https://google.com") dans la sandbox.
-- cliquer_e2b : Clique sur un élément (par sélecteur CSS ou texte visible).
-- taper_e2b : Tape du texte dans un champ de formulaire.
-- lire_page_e2b : Lit le contenu textuel de la page actuelle.
-- screenshot_e2b : Prend une capture d'écran de la page.
-- attendre_e2b : Attend un élément, un texte ou un délai (en ms).
-- cocher_case_e2b : Coche ou décoche une case.
-- scroller_e2b : Fait défiler la page.
-- calculer : Évalue une expression mathématique.
-- lire_fichier : Lit le contenu d'un fichier.
-- ecrire_fichier : Écrit du contenu dans un fichier.
-- lister_fichiers : Liste les fichiers d'un dossier.
-- obtenir_date : Donne la date et l'heure actuelles.
-- sauvegarder_credential : Sauvegarde des identifiants après une inscription.
-- lire_credential : Récupère des identifiants sauvegardés.
-- generate_mot_de_passe : Génère un mot de passe fort.
-- diagnostic_navigateur : Diagnostique l'état du navigateur.
-- tester_selecteur : Teste un sélecteur CSS.
 
-RÈGLES D'OR :
-1. Lorsque l'utilisateur demande une action qui correspond à un outil, tu DOIS appeler cet outil immédiatement, sans réponse textuelle préalable.
-2. Exemple : si l'utilisateur dit "ouvre un navigateur", appelle demarrer_sandbox.
-3. Si l'utilisateur te salue (bonjour, salut), réponds de manière amicale sans utiliser d'outils.
-4. Après avoir exécuté un outil, tu recevras son résultat. Tu dois alors fournir une réponse textuelle à l'utilisateur en synthétisant ce résultat.
-5. Pour la navigation web, la procédure typique est :
-   - Si le navigateur n'est pas encore ouvert, appelle demarrer_sandbox.
-   - Ensuite, utilise aller_vers_e2b pour charger une URL.
-   - Puis utilise les outils d'interaction (cliquer, taper, etc.) et de vérification (lire_page_e2b, screenshot_e2b).
-6. Sécurité : après une création de compte, sauvegarde toujours les identifiants avec sauvegarder_credential.
-7. Précision : prends un screenshot avant/après chaque action clé pour vérifier.
-8. Patience : utilise attendre_e2b pour laisser le temps aux éléments d'apparaître.
+Navigation (E2B Sandbox) :
+  - demarrer_sandbox, aller_vers_e2b, cliquer_e2b, taper_e2b
+  - lire_page_e2b, screenshot_e2b, attendre_e2b, cocher_case_e2b, scroller_e2b
 
-SÉLECTEURS COURANTS :
-- Google : 'input[name="q"]', 'textarea[name="q"]'.
-- Formulaires : privilégie les sélecteurs par texte pour les boutons (ex: { "selector": "button:has-text('Se connecter')" } ).`;
+Fichiers de base :
+  - calculer, lire_fichier, ecrire_fichier, lister_fichiers, obtenir_date
+
+Credentials :
+  - sauvegarder_credential, lire_credential, generate_mot_de_passe
+
+Debug :
+  - diagnostic_navigateur, tester_selecteur
+
+FS-Memory (PRIORITAIRE pour les grands resultats) :
+  - grep_memoire       : chercher un mot dans un fichier sauvegarde
+  - lire_lignes        : lire des lignes precises d'un fichier
+  - rechercher_glob    : lister les fichiers par pattern
+  - ecrire_decouverte  : sauvegarder une info importante trouvee
+  - ecrire_plan        : sauvegarder un plan avant une tache complexe
+  - apprendre_instruction : memoriser une instruction de l'utilisateur
+  - lire_instructions  : charger les instructions des sessions precedentes
+  - resume_session     : voir tous les fichiers crees dans la session
+
+REGLE FONDAMENTALE - GESTION DU CONTEXTE :
+Quand un outil retourne un resultat volumineux (page HTML, longue liste), il est
+AUTOMATIQUEMENT sauvegarde dans ./agent-memory/tool-results/ et tu recois un message
+court avec le chemin. Dans ce cas, utilise grep_memoire ou lire_lignes pour extraire
+UNIQUEMENT les informations dont tu as besoin. Ne recharge jamais tout le fichier.
+
+REGLES D'OR :
+1. Pour toute tache complexe (navigation + formulaire), commence par ecrire_plan.
+2. Quand tu trouves une info importante (selecteur CSS, URL, structure), utilise ecrire_decouverte.
+3. Apres une creation de compte, sauvegarde toujours les identifiants avec sauvegarder_credential.
+4. Si l'utilisateur te donne un conseil, utilise apprendre_instruction pour le memoriser.
+5. Prends un screenshot avant/apres chaque action cle pour verifier.
+6. Utilise attendre_e2b pour laisser le temps aux elements d'apparaitre.
+
+SELECTEURS COURANTS :
+- Google : 'input[name="q"]', 'textarea[name="q"]'
+- Formulaires : privilegier les selecteurs par texte (ex: button:has-text('Se connecter'))`;
+
+function construireSystemePrompt(): string {
+    return SYSTEME_PROMPT_BASE + chargerInstructionsMemoire();
+}
 
 // GRAPHE LANGGRAPH
 
@@ -217,48 +366,45 @@ const EtatAgent = Annotation.Root({
     }),
 });
 
-// NOEUD LLM — réfléchit et décide quoi faire
+const toolNodeBase = new ToolNode(TOUS_LES_TOOLS);
+
 async function noeudLLM(etat: typeof EtatAgent.State) {
-    console.log("📥 Entrée dans noeudLLM. Nombre de messages:", etat.messages.length);
+    console.log(`noeudLLM - ${etat.messages.length} msgs | Provider : ${multiLLM.getCurrentProviderName()}`);
 
     const dernier = etat.messages.at(-1);
     if (dernier instanceof ToolMessage) {
-        console.log("🔧 Dernier message ToolMessage:", String(dernier.content).slice(0, 200));
+        console.log("ToolMessage recu:", String(dernier.content).slice(0, 150));
     }
 
     try {
+        const SYSTEME_PROMPT = construireSystemePrompt();
         const optimizedContext = await contextManager.getOptimizedContext(SYSTEME_PROMPT);
-        const allMessages = [...optimizedContext, ...etat.messages];
+        const allMessages      = [...optimizedContext, ...etat.messages];
 
         const stats = contextManager.getContextStats();
         console.log(
-            `📊 Contexte: ${stats.totalMessages} msgs, ` +
-            `${stats.currentTokens} tokens, ` +
-            `compression: ${((1 - stats.compressionRatio) * 100).toFixed(0)}%`
+            `Contexte : ${stats.totalMessages} msgs | ` +
+            `${stats.currentTokens} tokens | ` +
+            `compression : ${((1 - stats.compressionRatio) * 100).toFixed(0)}%`
         );
 
-        // 1. Respecter la limite de débit (rate limiter)
-        await rateLimiter.wait();
-
-        // 2. Appel LLM avec retry + backoff exponentiel
-        const reponse = await invokeWithRetry(llm, allMessages, MAX_RETRIES);
-
-        console.log("📤 Réponse LLM:", JSON.stringify(reponse, null, 2));
+        const reponse = await multiLLM.invoke(allMessages);
+        console.log("Reponse LLM recue.");
         return { messages: [reponse] };
 
     } catch (error: any) {
-        console.error("❌ Erreur définitive dans noeudLLM:", error?.message ?? error);
-        const msg = error?.status === 429
-            ? "Limite de requêtes API atteinte. Attends quelques secondes et réessaie."
+        console.error("Erreur definitive noeudLLM:", error?.message);
+        const message = error?.message?.includes("Tous les providers")
+            ? "Tous les quotas API sont epuises. Reessaie demain ou active la facturation."
             : `Une erreur technique est survenue : ${error?.message ?? "inconnue"}`;
-        return { messages: [new AIMessage(msg)] };
+        return { messages: [new AIMessage(message)] };
     }
 }
 
-// NOEUD D'OUTILS
-const toolNode = new ToolNode(TOUS_LES_TOOLS);
+async function noeudOutils(etat: typeof EtatAgent.State) {
+    return await toolNodeAvecOffload(etat, toolNodeBase);
+}
 
-// DÉCISION : appeler un tool ou terminer ?
 function decider(etat: typeof EtatAgent.State): string {
     const dernierMessage = etat.messages.at(-1);
 
@@ -269,18 +415,14 @@ function decider(etat: typeof EtatAgent.State): string {
         ((dernierMessage as any)?.kwargs?.tool_calls &&
             (dernierMessage as any).kwargs.tool_calls.length > 0);
 
-    if (hasToolCalls) {
-        console.log("🔀 decider → tools");
-        return "tools";
-    }
-    console.log("🔀 decider → END");
+    if (hasToolCalls) { console.log("decider -> tools"); return "tools"; }
+    console.log("decider -> END");
     return END;
 }
 
-// Construction du graphe
 const graphe = new StateGraph(EtatAgent)
     .addNode("llm", noeudLLM)
-    .addNode("tools", toolNode)
+    .addNode("tools", noeudOutils)
     .addEdge(START, "llm")
     .addConditionalEdges("llm", decider)
     .addEdge("tools", "llm")
@@ -290,7 +432,7 @@ const graphe = new StateGraph(EtatAgent)
 
 export interface AgentResponse {
     text: string;
-    screenshot?: string; // data:image/png;base64,…
+    screenshot?: string;
 }
 
 export async function traiterMessage(messageUtilisateur: string): Promise<AgentResponse> {
@@ -303,7 +445,6 @@ export async function traiterMessage(messageUtilisateur: string): Promise<AgentR
             { recursionLimit: 100 }
         );
 
-        // Scanner TOUS les messages pour trouver le screenshot le plus récent
         let screenshotData: string | undefined;
         for (const msg of resultat.messages) {
             if (
@@ -316,84 +457,68 @@ export async function traiterMessage(messageUtilisateur: string): Promise<AgentR
         }
 
         const reponseFinale = resultat.messages.at(-1);
-        let contenu = String(reponseFinale?.content ?? "Pas de réponse.");
-        if (!contenu.trim()) {
-            contenu = "[L'agent n'a pas généré de réponse textuelle.]";
-        }
+        let contenu = String(reponseFinale?.content ?? "Pas de reponse.");
+        if (!contenu.trim()) contenu = "[L'agent n'a pas genere de reponse textuelle.]";
 
         await contextManager.addMessage(new AIMessage(contenu));
         return { text: contenu, screenshot: screenshotData };
 
     } catch (error) {
-        console.error("❌ Erreur dans traiterMessage:", error);
-        const fallback = "Désolé, une erreur interne est survenue.";
+        console.error("Erreur dans traiterMessage:", error);
+        const fallback = "Desole, une erreur interne est survenue.";
         await contextManager.addMessage(new AIMessage(fallback));
         return { text: fallback };
     }
 }
 
-// INTERFACE CLI (uniquement si lancé directement : ts-node agent-complet.ts)
+// INTERFACE CLI
 
 async function demarrerInterface() {
-    const provider = process.env.LLM_PROVIDER ?? "gemini";
-    const model    = process.env.LLM_MODEL    ?? "gemini-2.0-flash";
-    const rpm      = getRPM();
+    console.log("\n" + "=".repeat(65));
+    console.log(" AGENT IA AUTONOME - LangChain + LangGraph + FS-Memory ");
+    console.log("=".repeat(65));
+    console.log("Providers (fallback automatique) :");
+    PROVIDERS_CHAIN.forEach((p, i) =>
+        console.log(`  ${i + 1}. ${p.name.padEnd(22)} ${p.rpm} req/min`)
+    );
+    console.log("FS-Memory : ./agent-memory/ (offload auto des gros resultats)");
+    console.log("-".repeat(65));
+    console.log("  'exit' -> Quitter | 'reset' -> Memoire | 'tools' -> Liste");
+    console.log("=".repeat(65) + "\n");
 
-    console.log("\n" + "=".repeat(60));
-    console.log(" AGENT IA AUTONOME — LangChain + LangGraph ");
-    console.log("=".repeat(60));
-    console.log(`🤖 Modèle    : ${provider.toUpperCase()} — ${model}`);
-    console.log(`⏱️  Rate limit : ${rpm} requêtes/min (marge de sécurité incluse)`);
-    console.log(`🔁 Max retry  : ${MAX_RETRIES} tentatives avec backoff exponentiel`);
-    console.log(" Tools     : Fichiers, Calcul, Navigateur E2B, Credentials");
-    console.log(" Mémoire   : Active (se souvient de la conversation)");
-    console.log("-".repeat(60));
-    console.log("Commandes spéciales :");
-    console.log("  'exit'    → Quitter");
-    console.log("  'reset'   → Effacer la mémoire");
-    console.log("  'tools'   → Lister les tools disponibles");
-    console.log("=".repeat(60) + "\n");
-
-    const rl = readline.createInterface({
-        input: process.stdin,
-        output: process.stdout,
-    });
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
     const LireQuestion = () => {
-        rl.question("Tu 💬 : ", async (input) => {
+        rl.question(`Tu [${multiLLM.getCurrentProviderName()}] : `, async (input) => {
             const msg = input.trim();
             if (!msg) { LireQuestion(); return; }
 
             if (msg.toLowerCase() === "exit") {
-                console.log("\n Fermeture…");
+                console.log("\n Fermeture...");
                 await navigateur.fermer();
                 await e2bSandbox.fermer();
                 rl.close();
                 process.exit(0);
             }
-
             if (msg.toLowerCase() === "reset") {
                 await memoireConversation.clear();
-                console.log(" Mémoire effacée.\n");
-                LireQuestion();
-                return;
+                console.log(" Memoire effacee.\n");
+                LireQuestion(); return;
             }
-
             if (msg.toLowerCase() === "tools") {
                 console.log("\n Tools disponibles :");
                 TOUS_LES_TOOLS.forEach(t =>
-                    console.log(`  - ${t.name}: ${t.description.slice(0, 70)}…`)
+                    console.log(`  - ${t.name}: ${t.description.slice(0, 70)}...`)
                 );
                 console.log();
-                LireQuestion();
-                return;
+                LireQuestion(); return;
             }
 
-            console.log("\n Agent réfléchit…\n");
+            console.log(`\n Agent reflechit... [${multiLLM.getCurrentProviderName()}]\n`);
             try {
                 const response = await traiterMessage(msg);
                 console.log(`\n Agent : ${response.text}\n`);
-                console.log("-".repeat(60) + "\n");
+                console.log("-".repeat(65) + "\n");
             } catch (error) {
                 console.error(`Erreur : ${(error as Error).message}\n`);
             }
