@@ -76,23 +76,18 @@ function classifierErreur(error: any): ErrorKind {
         return "QUOTA_EXHAUSTED";
     }
 
-    // 413 = requête trop grande pour ce modèle → passer au suivant
-    if (status === 413 || msg.includes("request too large") || msg.includes("too large")) {
-        return "QUOTA_EXHAUSTED";
-    }
-
-    // Cohere : "Missing required key" = incompatibilité de schema → passer au suivant
-    if (msg.includes("missing required key") || msg.includes("parameterdefinitions")) {
-        return "QUOTA_EXHAUSTED";
-    }
-
-    // Mistral : ordre de messages invalide ou tool_call_id manquant → passer au suivant
+    // Mistral : ordre de messages ou tool_call_id invalide → passer au suivant
     if (
         msg.includes("tool call id has to be defined") ||
         msg.includes("expected last role") ||
         msg.includes("message_order") ||
         msg.includes("invalid_request_message")
     ) {
+        return "QUOTA_EXHAUSTED";
+    }
+
+    // Gemini thinking : thought_signature manquant → passer au suivant
+    if (msg.includes("thought_signature") || msg.includes("missing a thought")) {
         return "QUOTA_EXHAUSTED";
     }
 
@@ -246,18 +241,10 @@ const PROVIDERS_CHAIN: ProviderConfig[] = [
         }).bindTools(tools),
     },
 
-    // ── 8. Gemini gemini-3-flash-preview — quota SÉPARÉ, en dernier recours
-    {
-        name: "Gemini gemini-3-flash-preview",
-        rpm: 9,
-        maxRetries: 3,
-        factory: (tools) => new ChatGoogleGenerativeAI({
-            model: "gemini-3-flash-preview",
-            temperature: 0,
-            apiKey: process.env.GOOGLE_API_KEY,
-            maxRetries: 0,
-        }).bindTools(tools),
-    },
+    // ── 8. Gemini gemini-3-flash-preview — DÉSACTIVÉ
+    // Ce modèle exige des "thought_signatures" sur les tool_calls
+    // provenant d'autres providers → incompatible en chaîne de fallback.
+    // Voir : https://ai.google.dev/gemini-api/docs/thought-signatures
 ];
 
 class MultiProviderLLM {
@@ -479,23 +466,20 @@ function construireSystemePrompt(): string {
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SANITISATION DES MESSAGES POUR PROVIDERS STRICTS (Mistral, Cohere)
+// SANITISATION DES MESSAGES POUR PROVIDERS STRICTS (Mistral)
 //
 // Mistral exige :
-//   1. Chaque ToolMessage a un tool_call_id correspondant à un AIMessage parent
-//   2. Le dernier message de la séquence est Human ou Tool (jamais AI terminal)
-//
-// On nettoie les messages avant chaque appel LLM.
+//   1. Chaque ToolMessage a un tool_call_id valide avec AIMessage parent
+//   2. Dernier message = Human ou Tool (jamais AI)
 // ─────────────────────────────────────────────────────────────────────────────
 
 function sanitiserMessages(messages: BaseMessage[]): BaseMessage[] {
 
-    // ── Passe 1 : supprimer les ToolMessages orphelins (sans AIMessage parent) ──
+    // ── Passe 1 : ToolMessages orphelins ──
     const pass1: BaseMessage[] = [];
-    for (let i = 0; i < messages.length; i++) {
-        const msg = messages[i];
+    for (const msg of messages) {
         if (msg instanceof ToolMessage) {
-            const prev     = pass1.at(-1);
+            const prev = pass1.at(-1);
             const hasParent = prev instanceof AIMessage && (
                 (prev.tool_calls?.length ?? 0) > 0 ||
                 ((prev.additional_kwargs?.tool_calls as any[])?.length ?? 0) > 0
@@ -508,7 +492,7 @@ function sanitiserMessages(messages: BaseMessage[]): BaseMessage[] {
         pass1.push(msg);
     }
 
-    // ── Passe 2 : supprimer les AIMessages avec tool_calls sans ToolMessage suivant ──
+    // ── Passe 2 : AIMessages avec tool_calls sans ToolMessage suivant ──
     const pass2: BaseMessage[] = [];
     for (let i = 0; i < pass1.length; i++) {
         const msg  = pass1[i];
@@ -524,8 +508,7 @@ function sanitiserMessages(messages: BaseMessage[]): BaseMessage[] {
         pass2.push(msg);
     }
 
-    // ── Passe 3 : garantir que le dernier message n'est jamais un AIMessage avec tool_calls
-    // (Mistral refuse si le contexte se termine sur un AI tool-call sans réponse)
+    // ── Passe 3 : retirer les AIMessages terminaux avec tool_calls ──
     const result = [...pass2];
     while (result.length > 0) {
         const last = result.at(-1)!;
@@ -538,6 +521,25 @@ function sanitiserMessages(messages: BaseMessage[]): BaseMessage[] {
             result.pop();
         } else {
             break;
+        }
+    }
+
+    // ── Passe 4 : Mistral refuse si le DERNIER message est un AIMessage (même sans tool_calls)
+    // Après suppression des orphelins, le contexte peut se terminer sur un AIMessage.
+    // On ajoute un HumanMessage invisible pour satisfaire la contrainte de rôle.
+    const last = result.at(-1);
+    if (last instanceof AIMessage) {
+        const lastText = String(last.content ?? "").trim();
+        if (!lastText) {
+            // AIMessage vide en fin → le retirer directement
+            result.pop();
+            console.warn(`⚠️  Sanitise : AIMessage vide terminal supprimé`);
+        } else {
+            // AIMessage avec contenu → ajouter un Human "relance"
+            result.push(new HumanMessage(
+                "[RELANCE SYSTÈME] Reprends la tâche là où tu t'es arrêté."
+            ));
+            console.warn(`⚠️  Sanitise : HumanMessage de relance ajouté (contexte terminait sur AIMessage)`);
         }
     }
 
@@ -575,7 +577,6 @@ async function noeudLLM(etat: typeof EtatAgent.State) {
             `compression : ${((1 - stats.compressionRatio) * 100).toFixed(0)}%`
         );
 
-        // Nettoyer les messages pour les providers stricts (Mistral, Cohere)
         const messagesSanitises = sanitiserMessages(allMessages);
         const reponse = await multiLLM.invoke(messagesSanitises);
         console.log("Reponse LLM recue.");
@@ -600,7 +601,7 @@ async function noeudLLM(etat: typeof EtatAgent.State) {
                     "Commence maintenant par l'action la plus logique."
                 ),
             ];
-            const reponseNudge = await multiLLM.invoke(sanitiserMessages(messagesAvecNudge));
+            const reponseNudge = await multiLLM.invoke(messagesAvecNudge);
             console.log("Réponse après nudge reçue.");
             return { messages: [reponseNudge] };
         }
