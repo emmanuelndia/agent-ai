@@ -76,10 +76,24 @@ function classifierErreur(error: any): ErrorKind {
         return "QUOTA_EXHAUSTED";
     }
 
-    // Mistral : "tool call id has to be defined" après sanitisation = skip
-    // (ne devrait plus arriver après sanitiserMessages, mais sécurité supplémentaire)
-    if (msg.includes("tool call id has to be defined")) {
-        return "RETRYABLE"; // On retente après sanitisation
+    // 413 = requête trop grande pour ce modèle → passer au suivant
+    if (status === 413 || msg.includes("request too large") || msg.includes("too large")) {
+        return "QUOTA_EXHAUSTED";
+    }
+
+    // Cohere : "Missing required key" = incompatibilité de schema → passer au suivant
+    if (msg.includes("missing required key") || msg.includes("parameterdefinitions")) {
+        return "QUOTA_EXHAUSTED";
+    }
+
+    // Mistral : ordre de messages invalide ou tool_call_id manquant → passer au suivant
+    if (
+        msg.includes("tool call id has to be defined") ||
+        msg.includes("expected last role") ||
+        msg.includes("message_order") ||
+        msg.includes("invalid_request_message")
+    ) {
+        return "QUOTA_EXHAUSTED";
     }
 
     return "FATAL";
@@ -465,67 +479,69 @@ function construireSystemePrompt(): string {
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SANITISATION DES MESSAGES POUR MISTRAL ET AUTRES PROVIDERS STRICTS
+// SANITISATION DES MESSAGES POUR PROVIDERS STRICTS (Mistral, Cohere)
 //
-// Mistral exige que chaque ToolMessage ait un tool_call_id correspondant
-// à un tool_call dans l'AIMessage précédent. Si le contexte contient des
-// ToolMessages "orphelins" (sans leur AIMessage parent), Mistral refuse.
+// Mistral exige :
+//   1. Chaque ToolMessage a un tool_call_id correspondant à un AIMessage parent
+//   2. Le dernier message de la séquence est Human ou Tool (jamais AI terminal)
 //
-// Solution : nettoyer les messages avant de les envoyer à un provider strict.
-//   - Supprimer les ToolMessages sans AIMessage parent avec tool_calls
-//   - Supprimer les AIMessages avec tool_calls sans ToolMessages suivants
+// On nettoie les messages avant chaque appel LLM.
 // ─────────────────────────────────────────────────────────────────────────────
 
 function sanitiserMessages(messages: BaseMessage[]): BaseMessage[] {
-    const result: BaseMessage[] = [];
 
+    // ── Passe 1 : supprimer les ToolMessages orphelins (sans AIMessage parent) ──
+    const pass1: BaseMessage[] = [];
     for (let i = 0; i < messages.length; i++) {
         const msg = messages[i];
-
-        // Si c'est un ToolMessage, vérifier qu'il y a un AIMessage avec tool_calls juste avant
         if (msg instanceof ToolMessage) {
-            const precedent = result.at(-1);
-            const parentAI  = precedent instanceof AIMessage &&
-                (
-                    (precedent.tool_calls?.length ?? 0) > 0 ||
-                    (precedent.additional_kwargs?.tool_calls as any[])?.length > 0
-                );
-            if (!parentAI) {
-                console.warn(`⚠️  Sanitise : ToolMessage orphelin ignoré (tool_call_id: ${msg.tool_call_id})`);
-                continue; // Skip ce ToolMessage orphelin
-            }
-            // Vérifier que le tool_call_id est défini
-            if (!msg.tool_call_id) {
-                console.warn(`⚠️  Sanitise : ToolMessage sans tool_call_id ignoré`);
+            const prev     = pass1.at(-1);
+            const hasParent = prev instanceof AIMessage && (
+                (prev.tool_calls?.length ?? 0) > 0 ||
+                ((prev.additional_kwargs?.tool_calls as any[])?.length ?? 0) > 0
+            );
+            if (!hasParent || !msg.tool_call_id) {
+                console.warn(`⚠️  Sanitise : ToolMessage orphelin ignoré (id: ${msg.tool_call_id ?? "undefined"})`);
                 continue;
             }
         }
-
-        result.push(msg);
+        pass1.push(msg);
     }
 
-    // 2ème passe : retirer les AIMessages avec tool_calls qui ne sont pas suivis de ToolMessages
-    const result2: BaseMessage[] = [];
-    for (let i = 0; i < result.length; i++) {
-        const msg  = result[i];
-        const next = result[i + 1];
-
-        const hasToolCalls =
-            (msg instanceof AIMessage) &&
-            (
-                (msg.tool_calls?.length ?? 0) > 0 ||
-                (msg.additional_kwargs?.tool_calls as any[])?.length > 0
-            );
-
-        if (hasToolCalls && !(next instanceof ToolMessage)) {
+    // ── Passe 2 : supprimer les AIMessages avec tool_calls sans ToolMessage suivant ──
+    const pass2: BaseMessage[] = [];
+    for (let i = 0; i < pass1.length; i++) {
+        const msg  = pass1[i];
+        const next = pass1[i + 1];
+        const isAIWithTools = msg instanceof AIMessage && (
+            (msg.tool_calls?.length ?? 0) > 0 ||
+            ((msg.additional_kwargs?.tool_calls as any[])?.length ?? 0) > 0
+        );
+        if (isAIWithTools && !(next instanceof ToolMessage)) {
             console.warn(`⚠️  Sanitise : AIMessage avec tool_calls sans ToolMessage suivant ignoré`);
             continue;
         }
-
-        result2.push(msg);
+        pass2.push(msg);
     }
 
-    return result2;
+    // ── Passe 3 : garantir que le dernier message n'est jamais un AIMessage avec tool_calls
+    // (Mistral refuse si le contexte se termine sur un AI tool-call sans réponse)
+    const result = [...pass2];
+    while (result.length > 0) {
+        const last = result.at(-1)!;
+        const isTrailingToolAI = last instanceof AIMessage && (
+            (last.tool_calls?.length ?? 0) > 0 ||
+            ((last.additional_kwargs?.tool_calls as any[])?.length ?? 0) > 0
+        );
+        if (isTrailingToolAI) {
+            console.warn(`⚠️  Sanitise : AIMessage terminal avec tool_calls supprimé`);
+            result.pop();
+        } else {
+            break;
+        }
+    }
+
+    return result;
 }
 
 // GRAPHE LANGGRAPH
@@ -560,7 +576,6 @@ async function noeudLLM(etat: typeof EtatAgent.State) {
         );
 
         // Nettoyer les messages pour les providers stricts (Mistral, Cohere)
-        // Supprime les ToolMessages orphelins et AIMessages sans réponse outil
         const messagesSanitises = sanitiserMessages(allMessages);
         const reponse = await multiLLM.invoke(messagesSanitises);
         console.log("Reponse LLM recue.");
