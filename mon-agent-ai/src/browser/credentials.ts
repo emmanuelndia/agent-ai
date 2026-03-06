@@ -6,8 +6,6 @@ import * as crypto from "crypto";
 
 const opt = <T extends z.ZodTypeAny>(s: T) => s.optional().nullable();
 
-const opt = <T extends z.ZodTypeAny>(s: T) => s.optional().nullable();
-
 // TYPES
 interface Credential {
     id: string; 
