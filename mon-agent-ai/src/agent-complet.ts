@@ -27,18 +27,18 @@ const contextConfig: ContextConfig = {
   maxTokens: 28000,
   compressionThreshold: 0.75,
   summaryInterval: 8,
-  keepLastNMessages: 4
+  keepLastNMessages: 6
 };
 
 // Tous les tools disponibles pour l'agent (Playwright local + E2B sandbox)
 const TOUS_LES_TOOLS = [...outilsDeBase, /* ...browserTools,  */...e2bTools, ...credentialTools, ...debugTools];
 
 // Le cerveau de l'agent (Google Generative AI)
-const llm = new ChatGroq({
-    model: "llama-3.3-70b-versatile", // Ou ChatGroq llama-3.1-70b GROQ_API_KEY ou ChatGoogleGenerativeAI gemini-2.5-flash gemini-3-flash-preview GOOGLE_API_KEY
+const llm = new ChatGoogleGenerativeAI({
+    model: "gemini-2.0-flash", // Ou ChatGroq llama-3.1-70b GROQ_API_KEY ou ChatGoogleGenerativeAI gemini-2.5-flash gemini-3-flash-preview GOOGLE_API_KEY
     cache: new InMemoryCache(),
     temperature: 0, // 0 = plus précis, 1 = plus créatif
-    apiKey: process.env.GROQ_API_KEY,
+    apiKey: process.env.GOOGLE_API_KEY,
     maxRetries: 5,
 }).bindTools(TOUS_LES_TOOLS);
 
@@ -104,6 +104,31 @@ const EtatAgent = Annotation.Root({
 });
 
 
+// Ajoute un délai minimum entre chaque appel LLM pour ne jamais dépasser la limite
+class RateLimiter {
+    private lastCallTime = 0;
+    private minDelay: number;
+
+    constructor(requestsPerMinute: number) {
+        this.minDelay = (60 / requestsPerMinute) * 1000;
+    }
+
+    async wait() {
+        const now = Date.now();
+        const elapsed = now - this.lastCallTime;
+        if (elapsed < this.minDelay) {
+            const wait = this.minDelay - elapsed;
+            console.log(`🕒 Rate limiter: attente ${Math.round(wait)}ms...`);
+            await sleep(wait);
+        }
+        this.lastCallTime = Date.now();
+    }
+}
+
+
+// Crée une instance du rate limiter avec 25 requêtes par minute (sécurité supplémentaire)
+const rateLimiter = new RateLimiter(25);
+
 
 // NOEUD LLM : REFLECHIT ET DECIDE QUOI FAIRE
 async function noeudLLM(etat: typeof EtatAgent.State) {
@@ -113,11 +138,13 @@ async function noeudLLM(etat: typeof EtatAgent.State) {
         console.log("🔧 Dernier message est un ToolMessage, contenu:", dernier.content);
     }
     try {
+        
         const optimizedContext = await contextManager.getOptimizedContext(SYSTEME_PROMPT);
         const allMessages = [...optimizedContext, ...etat.messages];
         const stats = contextManager.getContextStats();
         console.log(`📊 Contexte: ${stats.totalMessages} messages, ${stats.currentTokens} tokens, compression: ${(1 - stats.compressionRatio) * 100}%`);
         
+        await rateLimiter.wait();
         const reponse = await llm.invoke(allMessages);
         console.log("📤 Réponse LLM brute:", JSON.stringify(reponse, null, 2));
         return { messages: [reponse] };
