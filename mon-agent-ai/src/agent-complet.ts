@@ -102,6 +102,28 @@ const PROVIDERS_CHAIN: ProviderConfig[] = [
         }).bindTools(tools),
     },
     {
+        name: "Gemini 3 Flash Preview",
+        rpm: 55,
+        maxRetries: 3,
+        factory: (tools) => new ChatGoogleGenerativeAI({
+            model: "gemini-3-flash-preview",
+            temperature: 0,
+            apiKey: process.env.GOOGLE_API_KEY,
+            maxRetries: 0,
+        }).bindTools(tools),
+    },
+    {
+        name: "Gemini 2.5 Flash",
+        rpm: 55,
+        maxRetries: 3,
+        factory: (tools) => new ChatGoogleGenerativeAI({
+            model: "gemini-2.5-flash",
+            temperature: 0,
+            apiKey: process.env.GOOGLE_API_KEY,
+            maxRetries: 0,
+        }).bindTools(tools),
+    },
+    {
         name: "Groq llama-3.3-70b",
         rpm: 25,
         maxRetries: 3,
