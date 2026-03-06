@@ -20,40 +20,154 @@ import console from "console";
 
 dotenv.config();
 
+// UTILITAIRES RATE LIMIT
 
+/** Pause asynchrone */
+const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
-// CONFIGURATION
+/**
+ * Rate Limiter — garantit un délai minimum entre chaque appel LLM.
+ * Empêche de dépasser la limite de requêtes par minute des APIs gratuites.
+ *
+ *   Gemini 2.0 Flash (gratuit) : 60 RPM  → utiliser RateLimiter(55)
+ *   Groq llama-3.1-8b-instant  : 30 RPM  → utiliser RateLimiter(25)
+ *   Groq llama-3.3-70b         : 30 RPM  → utiliser RateLimiter(25)
+ */
+class RateLimiter {
+    private lastCallTime = 0;
+    private readonly minDelay: number;
+
+    constructor(requestsPerMinute: number) {
+        // On prend une marge de sécurité de 10 % sur la limite déclarée
+        this.minDelay = (60 / requestsPerMinute) * 1000;
+    }
+
+    async wait(): Promise<void> {
+        const now = Date.now();
+        const elapsed = now - this.lastCallTime;
+        if (elapsed < this.minDelay) {
+            const waitMs = this.minDelay - elapsed;
+            console.log(`🕒 Rate limiter : pause de ${Math.round(waitMs)}ms avant le prochain appel LLM…`);
+            await sleep(waitMs);
+        }
+        this.lastCallTime = Date.now();
+    }
+}
+
+/**
+ * Retry avec backoff exponentiel — gère les erreurs 429 (rate limit) et
+ * les erreurs réseau temporaires retournées par Groq / Gemini.
+ *
+ * Délais : 2s → 4s → 8s → 16s → 32s (max 5 tentatives)
+ */
+async function invokeWithRetry(
+    llm: ReturnType<typeof creerLLM>,
+    messages: BaseMessage[],
+    maxRetries = 5
+): Promise<any> {
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+            return await (llm as any).invoke(messages);
+        } catch (error: any) {
+            const isRateLimit =
+                error?.status === 429 ||
+                error?.code === "rate_limit_exceeded" ||
+                error?.message?.toLowerCase().includes("rate_limit") ||
+                error?.message?.toLowerCase().includes("rate limit") ||
+                error?.message?.toLowerCase().includes("quota") ||
+                error?.message?.toLowerCase().includes("too many requests") ||
+                error?.message?.toLowerCase().includes("resource_exhausted");
+
+            const isRetryable =
+                isRateLimit ||
+                error?.status === 503 ||
+                error?.message?.toLowerCase().includes("overloaded") ||
+                error?.message?.toLowerCase().includes("timeout");
+
+            if (isRetryable && attempt < maxRetries - 1) {
+                // Backoff exponentiel : 2s, 4s, 8s, 16s, 32s
+                const waitSec = Math.pow(2, attempt + 1);
+                console.warn(
+                    `⚠️  ${isRateLimit ? "Rate limit" : "Erreur temporaire"} détecté(e). ` +
+                    `Tentative ${attempt + 1}/${maxRetries} — attente ${waitSec}s…`
+                );
+                await sleep(waitSec * 1000);
+                continue;
+            }
+
+            // Erreur non-récupérable ou tentatives épuisées
+            throw error;
+        }
+    }
+}
+
+// CONFIGURATION DU MODÈLE LLM (via variables d'environnement)
+
+function creerLLM() {
+    const provider     = process.env.LLM_PROVIDER    ?? "gemini";
+    const maxRetries   = parseInt(process.env.LLM_MAX_RETRIES ?? "5");
+
+    if (provider === "groq") {
+        const model = process.env.LLM_MODEL ?? "llama-3.1-8b-instant";
+        console.log(`🤖 LLM : Groq — ${model}`);
+        return new ChatGroq({
+            model,
+            cache: new InMemoryCache(),
+            temperature: 0,
+            apiKey: process.env.GROQ_API_KEY,
+            maxRetries: 0,   // On gère les retries manuellement avec invokeWithRetry
+        });
+    }
+
+    // Défaut : Gemini (60 RPM sur le tier gratuit)
+    const model = process.env.LLM_MODEL ?? "gemini-2.0-flash";
+    console.log(`🤖 LLM : Gemini — ${model}`);
+    return new ChatGoogleGenerativeAI({
+        model,
+        cache: new InMemoryCache(),
+        temperature: 0,
+        apiKey: process.env.GOOGLE_API_KEY,
+        maxRetries: 0,   // On gère les retries manuellement avec invokeWithRetry
+    });
+}
+
+// Déduire le RPM cible selon le provider (peut être surchargé via LLM_RPM)
+function getRPM(): number {
+    if (process.env.LLM_RPM) return parseInt(process.env.LLM_RPM);
+    const provider = process.env.LLM_PROVIDER ?? "gemini";
+    return provider === "groq" ? 25 : 55; // marge de sécurité sur les limites
+}
+
+// INITIALISATION GLOBALE
+
+const TOUS_LES_TOOLS = [
+    ...outilsDeBase,
+    /* ...browserTools, */
+    ...e2bTools,
+    ...credentialTools,
+    ...debugTools,
+];
+
+const llmBase   = creerLLM();
+const llm       = (llmBase as any).bindTools(TOUS_LES_TOOLS);
+const rateLimiter = new RateLimiter(getRPM());
+
+const MAX_RETRIES = parseInt(process.env.LLM_MAX_RETRIES ?? "5");
+
+// Gestionnaire de contexte
 const contextConfig: ContextConfig = {
-  maxTokens: 28000,
-  compressionThreshold: 0.75,
-  summaryInterval: 8,
-  keepLastNMessages: 6
+    maxTokens: 28000,
+    compressionThreshold: 0.75,
+    summaryInterval: 8,
+    keepLastNMessages: 6,
 };
+export const contextManager = new AdvancedContextManager(contextConfig, llmBase as any);
 
-// Tous les tools disponibles pour l'agent (Playwright local + E2B sandbox)
-const TOUS_LES_TOOLS = [...outilsDeBase, /* ...browserTools,  */...e2bTools, ...credentialTools, ...debugTools];
-
-// Le cerveau de l'agent (Google Generative AI)
-const llm = new ChatGoogleGenerativeAI({
-    model: "gemini-2.0-flash", // Ou ChatGroq llama-3.1-70b GROQ_API_KEY ou ChatGoogleGenerativeAI gemini-2.5-flash gemini-3-flash-preview GOOGLE_API_KEY
-    cache: new InMemoryCache(),
-    temperature: 0, // 0 = plus précis, 1 = plus créatif
-    apiKey: process.env.GOOGLE_API_KEY,
-    maxRetries: 5,
-}).bindTools(TOUS_LES_TOOLS);
-
-
-// Gestionnaire de contexte avancé
-export const contextManager = new AdvancedContextManager(contextConfig, llm);
-
-
-// Ancienne mémoire conservée pour compatibilité
-
+// Mémoire conservée pour compatibilité avec la CLI
 const memoireConversation = new InMemoryChatMessageHistory();
 
+// SYSTEM PROMPT
 
-
-// SYSTEM_PROMPT
 const SYSTEME_PROMPT = `Tu es un expert IA autonome. Tu disposes des outils suivants pour interagir avec le monde extérieur. Réponds toujours en français.
 
 OUTILS DISPONIBLES :
@@ -92,10 +206,10 @@ RÈGLES D'OR :
 
 SÉLECTEURS COURANTS :
 - Google : 'input[name="q"]', 'textarea[name="q"]'.
-- Formulaires : privilégie les sélecteurs par texte pour les boutons (ex: { "selector": "button:has-text('Se connecter')" } ).`
-         
+- Formulaires : privilégie les sélecteurs par texte pour les boutons (ex: { "selector": "button:has-text('Se connecter')" } ).`;
 
 // GRAPHE LANGGRAPH
+
 const EtatAgent = Annotation.Root({
     messages: Annotation<BaseMessage[]>({
         reducer: (ancien, nouveau) => [...ancien, ...nouveau],
@@ -103,88 +217,67 @@ const EtatAgent = Annotation.Root({
     }),
 });
 
-
-// Ajoute un délai minimum entre chaque appel LLM pour ne jamais dépasser la limite
-class RateLimiter {
-    private lastCallTime = 0;
-    private minDelay: number;
-
-    constructor(requestsPerMinute: number) {
-        this.minDelay = (60 / requestsPerMinute) * 1000;
-    }
-
-    async wait() {
-        const now = Date.now();
-        const elapsed = now - this.lastCallTime;
-        if (elapsed < this.minDelay) {
-            const wait = this.minDelay - elapsed;
-            console.log(`🕒 Rate limiter: attente ${Math.round(wait)}ms...`);
-            await sleep(wait);
-        }
-        this.lastCallTime = Date.now();
-    }
-}
-
-
-// Crée une instance du rate limiter avec 25 requêtes par minute (sécurité supplémentaire)
-const rateLimiter = new RateLimiter(25);
-
-
-// NOEUD LLM : REFLECHIT ET DECIDE QUOI FAIRE
+// NOEUD LLM — réfléchit et décide quoi faire
 async function noeudLLM(etat: typeof EtatAgent.State) {
     console.log("📥 Entrée dans noeudLLM. Nombre de messages:", etat.messages.length);
+
     const dernier = etat.messages.at(-1);
     if (dernier instanceof ToolMessage) {
-        console.log("🔧 Dernier message est un ToolMessage, contenu:", dernier.content);
+        console.log("🔧 Dernier message ToolMessage:", String(dernier.content).slice(0, 200));
     }
+
     try {
-        
         const optimizedContext = await contextManager.getOptimizedContext(SYSTEME_PROMPT);
         const allMessages = [...optimizedContext, ...etat.messages];
+
         const stats = contextManager.getContextStats();
-        console.log(`📊 Contexte: ${stats.totalMessages} messages, ${stats.currentTokens} tokens, compression: ${(1 - stats.compressionRatio) * 100}%`);
-        
-        await rateLimiter.wait(); 
-        const reponse = await llm.invoke(allMessages);
-        console.log("📤 Réponse LLM brute:", JSON.stringify(reponse, null, 2));
+        console.log(
+            `📊 Contexte: ${stats.totalMessages} msgs, ` +
+            `${stats.currentTokens} tokens, ` +
+            `compression: ${((1 - stats.compressionRatio) * 100).toFixed(0)}%`
+        );
+
+        // 1. Respecter la limite de débit (rate limiter)
+        await rateLimiter.wait();
+
+        // 2. Appel LLM avec retry + backoff exponentiel
+        const reponse = await invokeWithRetry(llm, allMessages, MAX_RETRIES);
+
+        console.log("📤 Réponse LLM:", JSON.stringify(reponse, null, 2));
         return { messages: [reponse] };
-    } catch (error) {
-        console.error("❌ Erreur dans noeudLLM:", error);
-        const errorMessage = new AIMessage(`Désolé, une erreur technique est survenue avec le modèle : ${(error as Error).message}`);
-        return { messages: [errorMessage] };
+
+    } catch (error: any) {
+        console.error("❌ Erreur définitive dans noeudLLM:", error?.message ?? error);
+        const msg = error?.status === 429
+            ? "Limite de requêtes API atteinte. Attends quelques secondes et réessaie."
+            : `Une erreur technique est survenue : ${error?.message ?? "inconnue"}`;
+        return { messages: [new AIMessage(msg)] };
     }
 }
-
-
 
 // NOEUD D'OUTILS
 const toolNode = new ToolNode(TOUS_LES_TOOLS);
-console.log(toolNode);
 
-// DECISION : APPELER UN TOOL OU TERMINER ?
+// DÉCISION : appeler un tool ou terminer ?
 function decider(etat: typeof EtatAgent.State): string {
     const dernierMessage = etat.messages.at(-1);
-    console.log("decider - dernier message complet:", JSON.stringify(dernierMessage, (key, value) => 
-    typeof value === 'function' ? undefined : value, 2));
-    
-    // Vérification robuste de la présence de tool_calls
-    const hasToolCalls = 
+
+    const hasToolCalls =
         (dernierMessage?.tool_calls && dernierMessage.tool_calls.length > 0) ||
-        (dernierMessage?.additional_kwargs?.tool_calls && dernierMessage.additional_kwargs.tool_calls.length > 0) ||
-        ((dernierMessage as any)?.kwargs?.tool_calls && (dernierMessage as any).kwargs.tool_calls.length > 0);
+        (dernierMessage?.additional_kwargs?.tool_calls &&
+            (dernierMessage.additional_kwargs.tool_calls as any[]).length > 0) ||
+        ((dernierMessage as any)?.kwargs?.tool_calls &&
+            (dernierMessage as any).kwargs.tool_calls.length > 0);
 
     if (hasToolCalls) {
-        console.log("decider - tool_calls détectés, direction tools");
+        console.log("🔀 decider → tools");
         return "tools";
     }
-    console.log("decider - pas de tool_calls, direction END");
+    console.log("🔀 decider → END");
     return END;
 }
 
-
-
-
-// CONSTRUIRE LE GRAPHE
+// Construction du graphe
 const graphe = new StateGraph(EtatAgent)
     .addNode("llm", noeudLLM)
     .addNode("tools", toolNode)
@@ -193,33 +286,32 @@ const graphe = new StateGraph(EtatAgent)
     .addEdge("tools", "llm")
     .compile();
 
+// API PUBLIQUE
 
-
-
-
-// INTERFACE TERMINAL
 export interface AgentResponse {
     text: string;
-    screenshot?: string; // data:image/png;base64,... si un screenshot a été pris
+    screenshot?: string; // data:image/png;base64,…
 }
 
 export async function traiterMessage(messageUtilisateur: string): Promise<AgentResponse> {
     try {
         const messageEntrant = new HumanMessage(messageUtilisateur);
         await contextManager.addMessage(messageEntrant);
-        const resultat = await graphe.invoke({ messages: [messageEntrant] }, { recursionLimit: 100 });
 
-        // ✅ FIX : Scanner TOUS les messages pour trouver le screenshot le plus récent.
-        // Le dernier message est toujours un AIMessage (LangGraph repasse par le LLM
-        // après chaque tool), donc on ne peut pas se fier uniquement au dernier message.
+        const resultat = await graphe.invoke(
+            { messages: [messageEntrant] },
+            { recursionLimit: 100 }
+        );
+
+        // Scanner TOUS les messages pour trouver le screenshot le plus récent
         let screenshotData: string | undefined;
         for (const msg of resultat.messages) {
             if (
                 msg instanceof ToolMessage &&
-                typeof msg.content === 'string' &&
-                msg.content.startsWith('data:image')
+                typeof msg.content === "string" &&
+                msg.content.startsWith("data:image")
             ) {
-                screenshotData = msg.content; // on garde le dernier screenshot trouvé
+                screenshotData = msg.content;
             }
         }
 
@@ -228,9 +320,10 @@ export async function traiterMessage(messageUtilisateur: string): Promise<AgentR
         if (!contenu.trim()) {
             contenu = "[L'agent n'a pas généré de réponse textuelle.]";
         }
-        await contextManager.addMessage(new AIMessage(contenu));
 
+        await contextManager.addMessage(new AIMessage(contenu));
         return { text: contenu, screenshot: screenshotData };
+
     } catch (error) {
         console.error("❌ Erreur dans traiterMessage:", error);
         const fallback = "Désolé, une erreur interne est survenue.";
@@ -239,161 +332,78 @@ export async function traiterMessage(messageUtilisateur: string): Promise<AgentR
     }
 }
 
-
+// INTERFACE CLI (uniquement si lancé directement : ts-node agent-complet.ts)
 
 async function demarrerInterface() {
+    const provider = process.env.LLM_PROVIDER ?? "gemini";
+    const model    = process.env.LLM_MODEL    ?? "gemini-2.0-flash";
+    const rpm      = getRPM();
 
     console.log("\n" + "=".repeat(60));
-
-    console.log(" AGENT IA AUTONOME - LangChain + Google Gemini + Playwright ");
-
+    console.log(" AGENT IA AUTONOME — LangChain + LangGraph ");
     console.log("=".repeat(60));
-
-    console.log("Modèle : gemini-1.5-flash (Google Generative AI)");
-
-    console.log(" Tools    : Fichiers, Calcul, Navigateur, Credentials");
-
+    console.log(`🤖 Modèle    : ${provider.toUpperCase()} — ${model}`);
+    console.log(`⏱️  Rate limit : ${rpm} requêtes/min (marge de sécurité incluse)`);
+    console.log(`🔁 Max retry  : ${MAX_RETRIES} tentatives avec backoff exponentiel`);
+    console.log(" Tools     : Fichiers, Calcul, Navigateur E2B, Credentials");
     console.log(" Mémoire   : Active (se souvient de la conversation)");
-
     console.log("-".repeat(60));
-
     console.log("Commandes spéciales :");
-
     console.log("  'exit'    → Quitter");
-
     console.log("  'reset'   → Effacer la mémoire");
-
     console.log("  'tools'   → Lister les tools disponibles");
-
     console.log("=".repeat(60) + "\n");
 
-
-
     const rl = readline.createInterface({
-
         input: process.stdin,
-
         output: process.stdout,
-
     });
 
-
-
     const LireQuestion = () => {
-
         rl.question("Tu 💬 : ", async (input) => {
-
             const msg = input.trim();
-
-
-
-            if(!msg) {
-
-                LireQuestion();
-
-                return;
-
-            }
-
-
-
-            // Commandes spéciales
+            if (!msg) { LireQuestion(); return; }
 
             if (msg.toLowerCase() === "exit") {
-
-                console.log("\n Fermeture...");
-
+                console.log("\n Fermeture…");
                 await navigateur.fermer();
-
                 await e2bSandbox.fermer();
-
                 rl.close();
-
                 process.exit(0);
-
             }
-
-
 
             if (msg.toLowerCase() === "reset") {
-
                 await memoireConversation.clear();
-
-                console.log(" Memoire effacée.\n");
-
+                console.log(" Mémoire effacée.\n");
                 LireQuestion();
-
                 return;
-
             }
-
-
 
             if (msg.toLowerCase() === "tools") {
-
                 console.log("\n Tools disponibles :");
-
-                TOUS_LES_TOOLS.forEach((t) => console.log(`- ${t.name}: ${t.description.slice(0, 60)}...`));
-
+                TOUS_LES_TOOLS.forEach(t =>
+                    console.log(`  - ${t.name}: ${t.description.slice(0, 70)}…`)
+                );
                 console.log();
-
                 LireQuestion();
-
                 return;
-
             }
 
-
-
-            // Traiter avec l'agent
-
-            console.log("\n Agent réfléchit...\n");
-
-
-
+            console.log("\n Agent réfléchit…\n");
             try {
-
                 const response = await traiterMessage(msg);
-
-                console.log(`\n Agent : ${response}\n`);
-
+                console.log(`\n Agent : ${response.text}\n`);
                 console.log("-".repeat(60) + "\n");
-
             } catch (error) {
-
                 console.error(`Erreur : ${(error as Error).message}\n`);
-
             }
-
             LireQuestion();
-
         });
-
     };
 
     LireQuestion();
-
 }
 
-
-
-// --- SECTION DE DÉMARRAGE ---
-
-// On définit une fonction pour lancer la console
-async function executerModeConsole() {
-  try {
-    await demarrerInterface();
-  } catch (error) {
-    console.error("Erreur interface console:", error);
-  }
-}
-
-
-// Lancer l'agent
-
-// On ne lance l'interface console QUE si on exécute ce fichier directement
-// (ex: npx ts-node src/agent-complet.ts)
-// Si c'est server.ts qui l'importe, cette partie sera ignorée.
 if (require.main === module) {
-    executerModeConsole();
+    demarrerInterface().catch(err => console.error("Erreur interface console:", err));
 }
