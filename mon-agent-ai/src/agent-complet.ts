@@ -594,31 +594,25 @@ function sanitiserMessages(messages: BaseMessage[]): BaseMessage[] {
             const content     = String(msg.content ?? "").trim();
             const hasTools    = toolCalls.length > 0 || toolCallsAK.length > 0;
 
-            // Passe 0A : AIMessage vide (ni contenu ni tool_calls) → supprimer
+            // ── Passe 0A : AIMessage vide → supprimer ──
             if (!content && !hasTools) {
-                console.warn(`⚠️  Sanitise P0A : AIMessage vide supprimé (ni content ni tool_calls)`);
+                console.warn(`⚠️  Sanitise P0A : AIMessage vide supprimé`);
                 i++;
                 continue;
             }
 
             if (hasTools) {
-                const missingId =
-                    toolCalls.some(tc => !tc.id) ||
-                    toolCallsAK.some((tc: any) => !tc.id);
+                // ── RÈGLE FONDAMENTALE ──────────────────────────────────────────────
+                // msg.tool_calls   = représentation LangChain canonique (avec ids)
+                // additional_kwargs.tool_calls = format brut du provider (Gemini : sans id)
+                //
+                // On NE vérifie les ids QUE dans msg.tool_calls (la source de vérité).
+                // additional_kwargs sera toujours RECONSTRUIT en format OpenAI standard.
+                // Ne jamais supprimer un AIMessage à cause du format de additional_kwargs.
+                // ───────────────────────────────────────────────────────────────────
 
-                // Passe 0B-1 : ids manquants → supprimer AIMessage + ses ToolMessages
-                if (missingId) {
-                    let j = i + 1, skipped = 0;
-                    while (j < messages.length && messages[j] instanceof ToolMessage) { j++; skipped++; }
-                    console.warn(`⚠️  Sanitise P0B : AIMessage sans id supprimé${skipped > 0 ? ` + ${skipped} ToolMessage(s)` : ""}`);
-                    i = j;
-                    continue;
-                }
-
-                // Passe 0B-2 : ids OK → reconstruire additional_kwargs en format OpenAI
-                // pour que Groq/Mistral lisent des ids valides (ils lisent additional_kwargs,
-                // pas msg.tool_calls)
-                if (toolCalls.length > 0) {
+                // Cas 1 : msg.tool_calls présents avec ids → reconstruire AK et garder
+                if (toolCalls.length > 0 && toolCalls.every(tc => !!tc.id)) {
                     const akNormalisé = toolCalls.map(tc => ({
                         id      : tc.id!,
                         type    : "function" as const,
@@ -636,6 +630,48 @@ function sanitiserMessages(messages: BaseMessage[]): BaseMessage[] {
                     }));
                     i++;
                     continue;
+                }
+
+                // Cas 2 : msg.tool_calls présents MAIS certains sans id → irrécupérable
+                if (toolCalls.length > 0 && toolCalls.some(tc => !tc.id)) {
+                    let j = i + 1, skipped = 0;
+                    while (j < messages.length && messages[j] instanceof ToolMessage) { j++; skipped++; }
+                    console.warn(`⚠️  Sanitise P0B : tool_calls sans id → AIMessage supprimé${skipped > 0 ? ` + ${skipped} ToolMessage(s)` : ""}`);
+                    i = j;
+                    continue;
+                }
+
+                // Cas 3 : msg.tool_calls vide mais additional_kwargs non vide
+                // (format provider sans mapping LangChain) → tenter de récupérer les ids depuis AK
+                if (toolCalls.length === 0 && toolCallsAK.length > 0) {
+                    const akHasIds = toolCallsAK.every((tc: any) => !!tc.id);
+                    if (akHasIds) {
+                        // Reconstruire tool_calls LangChain depuis additional_kwargs
+                        const rebuiltToolCalls = toolCallsAK.map((tc: any) => ({
+                            id  : tc.id,
+                            name: tc.function?.name ?? tc.name ?? "unknown",
+                            args: (() => {
+                                try { return JSON.parse(tc.function?.arguments ?? tc.arguments ?? "{}"); }
+                                catch { return {}; }
+                            })(),
+                            type: "tool_call" as const,
+                        }));
+                        pass0.push(new AIMessage({
+                            content          : msg.content,
+                            tool_calls       : rebuiltToolCalls,
+                            additional_kwargs: { ...msg.additional_kwargs, tool_calls: toolCallsAK },
+                        }));
+                        console.warn(`⚠️  Sanitise P0C : tool_calls reconstruits depuis additional_kwargs`);
+                        i++;
+                        continue;
+                    } else {
+                        // AK sans ids → supprimer
+                        let j = i + 1, skipped = 0;
+                        while (j < messages.length && messages[j] instanceof ToolMessage) { j++; skipped++; }
+                        console.warn(`⚠️  Sanitise P0C : additional_kwargs sans id → AIMessage supprimé${skipped > 0 ? ` + ${skipped} ToolMessage(s)` : ""}`);
+                        i = j;
+                        continue;
+                    }
                 }
             }
         }
