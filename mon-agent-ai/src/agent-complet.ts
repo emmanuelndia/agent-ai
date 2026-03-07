@@ -81,15 +81,17 @@ function classifierErreur(error: any): ErrorKind {
         return "QUOTA_EXHAUSTED";
     }
 
-    // Mistral / OpenAI : erreur de FORMAT de message pour cette requête spécifique.
-    // → SKIP_REQUEST (pas QUOTA_EXHAUSTED) : le provider reste disponible pour la prochaine requête.
+    // Mistral / OpenAI : erreurs de FORMAT de message → SKIP (provider réutilisable)
     if (
         msg.includes("tool call id has to be defined") ||
         msg.includes("expected last role") ||
         msg.includes("message_order") ||
         msg.includes("invalid_request_message") ||
         msg.includes("all openai tool calls must have an") ||
-        msg.includes("\"id\" field")
+        msg.includes("\"id\" field") ||
+        // Mistral rejette un AIMessage avec content="" ET sans tool_calls
+        // Se produit quand un provider renvoie une réponse vide et qu'on la passe en contexte
+        msg.includes("assistant message must have either content or tool_calls")
     ) {
         return "SKIP";
     }
@@ -133,6 +135,22 @@ interface ProviderConfig {
     factory: (tools: any[]) => any;
 }
 
+/**
+ * Chaîne de fallback — 7 providers, 7 quotas indépendants.
+ *
+ * ┌──────────────────────────────┬──────┬──────────────┬─────────────────────┐
+ * │ Provider / Modèle            │ RPM  │ Req/jour     │ Notes               │
+ * ├──────────────────────────────┼──────┼──────────────┼─────────────────────┤
+ * │ Gemini 2.0 Flash             │  55  │    1 500     │ Meilleur pour agent │
+ * │ Cerebras llama-3.3-70b       │  28  │  illimité    │ Via wrapper OpenAI  │
+ * │ Groq llama-3.3-70b           │  25  │   14 400     │                     │
+ * │ Cohere command-r             │  20  │    1 000     │                     │
+ * │ Groq llama-3.1-8b            │  25  │   14 400 *   │ Quota séparé        │
+ * │ Gemini 2.5 Flash             │   9  │      500 *   │ Quota séparé        │
+ * │ Mistral small                │   4  │  illimité    │ 1 Md tokens/mois    │
+ * │ Gemini gemini-3-flash-preview│   9  │      500 *   │ Dernier recours     │
+ * └──────────────────────────────┴──────┴──────────────┴─────────────────────┘
+ */
 /**
  * Chaîne de fallback — ordre optimisé par quota/jour puis qualité.
  *
@@ -553,19 +571,16 @@ function construireSystemePrompt(): string {
 function sanitiserMessages(messages: BaseMessage[]): BaseMessage[] {
 
     // ═══════════════════════════════════════════════════════════════════════
-    // PASSE 0 — Normalisation des AIMessages avec tool_calls
+    // PASSE 0A : supprimer les AIMessages vides (ni content ni tool_calls)
+    // Mistral rejette code 400 "Assistant message must have either content
+    // or tool_calls" quand un AIMessage vide traîne dans le contexte.
+    // Cela arrive quand un provider (ex: Groq) retourne une réponse vide
+    // et qu'on l'ajoute au contexte pour le nudge.
     //
-    // PROBLÈME ROOT CAUSE :
-    //   Gemini génère un AIMessage où :
-    //     • msg.tool_calls[i].id   = "abc123"  ← LangChain (OK)
-    //     • msg.additional_kwargs.tool_calls[i] = format Gemini, sans "id"
-    //   Groq/Mistral sérialisent via additional_kwargs.tool_calls (format
-    //   OpenAI brut) → voient des ids manquants → plantent.
-    //
-    // STRATÉGIE :
-    //   • ids manquants dans tool_calls → supprimer AIMessage + ToolMessages
-    //   • ids présents dans tool_calls  → RECONSTRUIRE additional_kwargs en
-    //     format OpenAI standard, en copiant les ids depuis tool_calls
+    // PASSE 0B : normaliser additional_kwargs.tool_calls en format OpenAI
+    // Gemini génère tool_calls avec ids valides MAIS additional_kwargs dans
+    // son propre format (sans id). Groq/Mistral lisent additional_kwargs →
+    // on les reconstruit en format OpenAI standard depuis msg.tool_calls.
     // ═══════════════════════════════════════════════════════════════════════
 
     const pass0: BaseMessage[] = [];
@@ -576,24 +591,33 @@ function sanitiserMessages(messages: BaseMessage[]): BaseMessage[] {
         if (msg instanceof AIMessage) {
             const toolCalls   = msg.tool_calls ?? [];
             const toolCallsAK = (msg.additional_kwargs?.tool_calls as any[]) ?? [];
+            const content     = String(msg.content ?? "").trim();
             const hasTools    = toolCalls.length > 0 || toolCallsAK.length > 0;
 
+            // Passe 0A : AIMessage vide (ni contenu ni tool_calls) → supprimer
+            if (!content && !hasTools) {
+                console.warn(`⚠️  Sanitise P0A : AIMessage vide supprimé (ni content ni tool_calls)`);
+                i++;
+                continue;
+            }
+
             if (hasTools) {
-                // Cas 1 : ids manquants → supprimer ce message + ses ToolMessages
                 const missingId =
                     toolCalls.some(tc => !tc.id) ||
                     toolCallsAK.some((tc: any) => !tc.id);
 
+                // Passe 0B-1 : ids manquants → supprimer AIMessage + ses ToolMessages
                 if (missingId) {
                     let j = i + 1, skipped = 0;
                     while (j < messages.length && messages[j] instanceof ToolMessage) { j++; skipped++; }
-                    console.warn(`⚠️  Sanitise P0 : AIMessage sans id supprimé${skipped > 0 ? ` + ${skipped} ToolMessage(s)` : ""}`);
+                    console.warn(`⚠️  Sanitise P0B : AIMessage sans id supprimé${skipped > 0 ? ` + ${skipped} ToolMessage(s)` : ""}`);
                     i = j;
                     continue;
                 }
 
-                // Cas 2 : ids présents dans tool_calls → normaliser additional_kwargs
-                // en format OpenAI standard pour que Groq/Mistral le lisent correctement
+                // Passe 0B-2 : ids OK → reconstruire additional_kwargs en format OpenAI
+                // pour que Groq/Mistral lisent des ids valides (ils lisent additional_kwargs,
+                // pas msg.tool_calls)
                 if (toolCalls.length > 0) {
                     const akNormalisé = toolCalls.map(tc => ({
                         id      : tc.id!,
@@ -630,7 +654,7 @@ function sanitiserMessages(messages: BaseMessage[]): BaseMessage[] {
                 ((prev.additional_kwargs?.tool_calls as any[])?.length ?? 0) > 0
             );
             if (!hasParent || !msg.tool_call_id) {
-                console.warn(`⚠️  Sanitise : ToolMessage orphelin ignoré (id: ${msg.tool_call_id ?? "undefined"})`);
+                console.warn(`⚠️  Sanitise P1 : ToolMessage orphelin ignoré (id: ${msg.tool_call_id ?? "undefined"})`);
                 continue;
             }
         }
@@ -737,16 +761,18 @@ async function noeudLLM(etat: typeof EtatAgent.State) {
 
         if (!texte && !aDesTools) {
             console.warn("⚠️  Réponse vide détectée — relance avec nudge...");
+            // NE PAS inclure `reponse` (AIMessage vide) dans le contexte :
+            // Mistral rejette tout AIMessage sans content ni tool_calls (code 400).
+            // On injecte directement un HumanMessage de relance.
             const messagesAvecNudge = [
                 ...allMessages,
-                reponse,
                 new HumanMessage(
-                    "Ta réponse était vide. Rappel : tu dois OBLIGATOIREMENT utiliser " +
-                    "les outils disponibles pour répondre à la demande. " +
+                    "[RELANCE] Ta réponse précédente était vide. " +
+                    "Tu dois OBLIGATOIREMENT utiliser les outils disponibles. " +
                     "Commence maintenant par l'action la plus logique."
                 ),
             ];
-            const reponseNudge = await multiLLM.invoke(messagesAvecNudge);
+            const reponseNudge = await multiLLM.invoke(sanitiserMessages(messagesAvecNudge));
             console.log("Réponse après nudge reçue.");
             return { messages: [reponseNudge] };
         }
