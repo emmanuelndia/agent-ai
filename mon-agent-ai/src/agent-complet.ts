@@ -32,7 +32,12 @@ const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, m
 
 // CLASSIFICATION DES ERREURS API
 
-type ErrorKind = "QUOTA_EXHAUSTED" | "RATE_LIMIT" | "RETRYABLE" | "FATAL";
+type ErrorKind =
+    | "QUOTA_EXHAUSTED"  // quota journalier épuisé → skip définitif dans la session
+    | "SKIP_REQUEST"     // erreur de format pour CETTE requête → skip mais provider réutilisable
+    | "RATE_LIMIT"       // trop de requêtes → attendre et réessayer
+    | "RETRYABLE"        // erreur temporaire → réessayer
+    | "FATAL";           // erreur irrécupérable → stopper
 
 function classifierErreur(error: any): ErrorKind {
     const msg    = (error?.message ?? "").toLowerCase();
@@ -76,19 +81,22 @@ function classifierErreur(error: any): ErrorKind {
         return "QUOTA_EXHAUSTED";
     }
 
-    // Mistral : ordre de messages ou tool_call_id invalide → passer au suivant
+    // Mistral / OpenAI : erreur de FORMAT de message pour cette requête spécifique.
+    // → SKIP_REQUEST (pas QUOTA_EXHAUSTED) : le provider reste disponible pour la prochaine requête.
     if (
         msg.includes("tool call id has to be defined") ||
         msg.includes("expected last role") ||
         msg.includes("message_order") ||
-        msg.includes("invalid_request_message")
+        msg.includes("invalid_request_message") ||
+        msg.includes("all openai tool calls must have an") ||
+        msg.includes("id" field")
     ) {
-        return "QUOTA_EXHAUSTED";
+        return "SKIP_REQUEST";
     }
 
-    // Gemini thinking : thought_signature manquant → passer au suivant
+    // Gemini thinking : thought_signature manquant → skip cette requête
     if (msg.includes("thought_signature") || msg.includes("missing a thought")) {
-        return "QUOTA_EXHAUSTED";
+        return "SKIP_REQUEST";
     }
 
     return "FATAL";
@@ -126,80 +134,23 @@ interface ProviderConfig {
 }
 
 /**
- * Chaîne de fallback — ordre optimisé par quota/jour puis qualité.
- *
- * STRATÉGIE : illimités en tête, quotas limités en dernier recours.
+ * Chaîne de fallback — 7 providers, 7 quotas indépendants.
  *
  * ┌──────────────────────────────┬──────┬──────────────┬─────────────────────┐
  * │ Provider / Modèle            │ RPM  │ Req/jour     │ Notes               │
  * ├──────────────────────────────┼──────┼──────────────┼─────────────────────┤
- * │ Cerebras llama-3.3-70b       │  28  │  ILLIMITÉ    │ Illimité + capable  │
- * │ Groq llama-3.3-70b           │  25  │   14 400     │ Très capable        │
+ * │ Gemini 2.0 Flash             │  55  │    1 500     │ Meilleur pour agent │
+ * │ Cerebras llama-3.3-70b       │  28  │  illimité    │ Via wrapper OpenAI  │
+ * │ Groq llama-3.3-70b           │  25  │   14 400     │                     │
+ * │ Cohere command-r             │  20  │    1 000     │                     │
  * │ Groq llama-3.1-8b            │  25  │   14 400 *   │ Quota séparé        │
- * │ Mistral small                │   4  │  ILLIMITÉ    │ 1 Md tokens/mois    │
- * │ Gemini 2.0 Flash             │  55  │    1 500     │ Meilleur agent      │
  * │ Gemini 2.5 Flash             │   9  │      500 *   │ Quota séparé        │
- * │ Cohere command-r             │  20  │    1 000     │ Skip auto (schema)  │
+ * │ Mistral small                │   4  │  illimité    │ 1 Md tokens/mois    │
+ * │ Gemini gemini-3-flash-preview│   9  │      500 *   │ Dernier recours     │
  * └──────────────────────────────┴──────┴──────────────┴─────────────────────┘
  */
 const PROVIDERS_CHAIN: ProviderConfig[] = [
-
-    // ── 1. Cerebras llama-3.3-70b — ILLIMITÉ, très capable, 28 RPM
-    //       Via wrapper OpenAI-compatible (zéro conflit de dépendance)
-    {
-        name: "Cerebras llama-3.3-70b",
-        rpm: 28,
-        maxRetries: 3,
-        factory: (tools) => new ChatOpenAI({
-            model: "llama-3.3-70b",
-            temperature: 0,
-            apiKey: process.env.CEREBRAS_API_KEY,
-            configuration: { baseURL: "https://api.cerebras.ai/v1" },
-            maxRetries: 0,
-        }).bindTools(tools, { strict: false }),
-    },
-
-    // ── 2. Groq llama-3.3-70b — 14 400 req/jour, très capable
-    {
-        name: "Groq llama-3.3-70b",
-        rpm: 25,
-        maxRetries: 3,
-        factory: (tools) => new ChatGroq({
-            model: "llama-3.3-70b-versatile",
-            temperature: 0,
-            apiKey: process.env.GROQ_API_KEY,
-            maxRetries: 0,
-        }).bindTools(tools),
-    },
-
-    // ── 3. Groq llama-3.1-8b — quota SÉPARÉ du 3.3-70b
-    {
-        name: "Groq llama-3.1-8b",
-        rpm: 25,
-        maxRetries: 3,
-        factory: (tools) => new ChatGroq({
-            model: "llama-3.1-8b-instant",
-            temperature: 0,
-            apiKey: process.env.GROQ_API_KEY,
-            maxRetries: 0,
-        }).bindTools(tools),
-    },
-
-    // ── 4. Mistral small — ILLIMITÉ (1 Md tokens/mois), 4 RPM
-    {
-        name: "Mistral small",
-        rpm: 4,
-        maxRetries: 3,
-        factory: (tools) => new ChatMistralAI({
-            model: "mistral-small-latest",
-            temperature: 0,
-            apiKey: process.env.MISTRAL_API_KEY,
-            maxRetries: 0,
-        }).bindTools(tools),
-    },
-
-    // ── 5. Gemini 2.0 Flash — 1 500 req/jour, meilleur pour l'agentic
-    //       Réservé en dernier recours (quota limité précieux)
+    // ── 1. Gemini 2.0 Flash — meilleur pour l'agentic (60 RPM)
     {
         name: "Gemini 2.0 Flash",
         rpm: 55,
@@ -212,21 +163,41 @@ const PROVIDERS_CHAIN: ProviderConfig[] = [
         }).bindTools(tools),
     },
 
-    // ── 6. Gemini 2.5 Flash — 500 req/jour, quota SÉPARÉ du 2.0
+    // ── 2. Cerebras llama-3.3-70b — quota illimité, ultra-rapide
+    //       Utilise ChatOpenAI avec baseURL custom : zéro conflit de dépendance,
+    //       car @langchain/cerebras@1.0.x est incompatible avec @langchain/core@0.3.x
     {
-        name: "Gemini 2.5 Flash",
-        rpm: 9,
+        name: "Cerebras llama-3.3-70b",
+        rpm: 28,
         maxRetries: 3,
-        factory: (tools) => new ChatGoogleGenerativeAI({
-            model: "gemini-2.5-flash",
+        factory: (tools) => new ChatOpenAI({
+            model: "llama-3.3-70b",
             temperature: 0,
-            apiKey: process.env.GOOGLE_API_KEY,
+            apiKey: process.env.CEREBRAS_API_KEY,
+            configuration: {
+                baseURL: "https://api.cerebras.ai/v1",
+            },
+            maxRetries: 0,
+        // strict: false — désactive la validation Zod stricte d'OpenAI
+        // Nécessaire car Cerebras n'impose pas le mode "structured outputs"
+        // et nos tools utilisent .optional() sans .nullable()
+        }).bindTools(tools, { strict: false }),
+    },
+
+    // ── 3. Groq llama-3.3-70b — 14 400 req/jour, très capable
+    {
+        name: "Groq llama-3.3-70b",
+        rpm: 25,
+        maxRetries: 3,
+        factory: (tools) => new ChatGroq({
+            model: "llama-3.3-70b-versatile",
+            temperature: 0,
+            apiKey: process.env.GROQ_API_KEY,
             maxRetries: 0,
         }).bindTools(tools),
     },
 
-    // ── 7. Cohere command-r — sera skipé automatiquement (incompatibilité schema)
-    //       Gardé comme dernier filet au cas où les autres sont épuisés
+    // ── 4. Cohere command-r
     {
         name: "Cohere command-r",
         rpm: 20,
@@ -239,8 +210,49 @@ const PROVIDERS_CHAIN: ProviderConfig[] = [
         }).bindTools(tools, { strict: false }),
     },
 
-    // ── gemini-3-flash-preview — DÉSACTIVÉ
-    // Exige des "thought_signatures" sur les tool_calls d'autres providers.
+    // ── 5. Groq llama-3.1-8b — quota SÉPARÉ du 3.3-70b, très rapide
+    {
+        name: "Groq llama-3.1-8b",
+        rpm: 25,
+        maxRetries: 3,
+        factory: (tools) => new ChatGroq({
+            model: "llama-3.1-8b-instant",
+            temperature: 0,
+            apiKey: process.env.GROQ_API_KEY,
+            maxRetries: 0,
+        }).bindTools(tools),
+    },
+
+    // ── 6. Gemini 2.5 Flash — quota SÉPARÉ du 2.0 Flash
+    {
+        name: "Gemini 2.5 Flash",
+        rpm: 9,
+        maxRetries: 3,
+        factory: (tools) => new ChatGoogleGenerativeAI({
+            model: "gemini-2.5-flash",
+            temperature: 0,
+            apiKey: process.env.GOOGLE_API_KEY,
+            maxRetries: 0,
+        }).bindTools(tools),
+    },
+
+    // ── 7. Mistral small — 1 milliard de tokens/mois gratuits
+    {
+        name: "Mistral small",
+        rpm: 4,
+        maxRetries: 3,
+        factory: (tools) => new ChatMistralAI({
+            model: "mistral-small-latest",
+            temperature: 0,
+            apiKey: process.env.MISTRAL_API_KEY,
+            maxRetries: 0,
+        }).bindTools(tools),
+    },
+
+    // ── 8. Gemini gemini-3-flash-preview — DÉSACTIVÉ
+    // Ce modèle exige des "thought_signatures" sur les tool_calls
+    // provenant d'autres providers → incompatible en chaîne de fallback.
+    // Voir : https://ai.google.dev/gemini-api/docs/thought-signatures
 ];
 
 class MultiProviderLLM {
@@ -339,10 +351,17 @@ class MultiProviderLLM {
 
                     switch (kind) {
                         case "QUOTA_EXHAUSTED":
-                            // Quota épuisé de façon permanente (journée) → marquer et passer au suivant
+                            // Quota journalier épuisé → marquer définitivement et passer au suivant
                             console.warn(`Quota epuise sur [${config.name}] → skip définitif pour cette session`);
                             this.quotaEpuise.set(i, true);
-                            attempt = config.maxRetries; // sortir de la boucle de retries
+                            attempt = config.maxRetries;
+                            break;
+
+                        case "SKIP_REQUEST":
+                            // Erreur de format pour CETTE requête (ex: tool_call sans id, message_order)
+                            // → skip ce provider pour cette requête UNIQUEMENT, pas définitivement
+                            console.warn(`[${config.name}] format incompatible pour cette requête → skip (provider conservé)`);
+                            attempt = config.maxRetries;
                             break;
 
                         case "RATE_LIMIT": {
@@ -535,52 +554,28 @@ function construireSystemePrompt(): string {
 //   2. Dernier message = Human ou Tool (jamais AI)
 // ─────────────────────────────────────────────────────────────────────────────
 
-function genererToolCallId(): string {
-    return Math.random().toString(36).slice(2, 11);
-}
-
 function sanitiserMessages(messages: BaseMessage[]): BaseMessage[] {
 
-    // ── Passe 0 : garantir que tous les tool_calls dans les AIMessages ont un id ──
-    // Groq (wrapper OpenAI) exige un "id" sur chaque tool_call.
-    // Gemini et d'autres providers peuvent générer des tool_calls sans id.
-    // On assigne un id généré si manquant, plutôt que de supprimer le message.
+
+    // ── Passe 0 : garantir que tous les tool_calls ont un id ──
+    // Groq/OpenAI exigent un "id" sur chaque tool_call.
+    // Gemini peut générer des tool_calls sans id → on en assigne un.
     const pass0: BaseMessage[] = messages.map(msg => {
         if (!(msg instanceof AIMessage)) return msg;
-
         const toolCalls = msg.tool_calls ?? [];
-        const toolCallsAK = (msg.additional_kwargs?.tool_calls as any[]) ?? [];
-        const needsFix =
-            toolCalls.some(tc => !tc.id) ||
-            toolCallsAK.some((tc: any) => !tc.id);
-
+        const needsFix  = toolCalls.some(tc => !tc.id);
         if (!needsFix) return msg;
-
-        // Fixer tool_calls
         const fixedToolCalls = toolCalls.map(tc => {
             if (tc.id) return tc;
-            const newId = genererToolCallId();
-            console.warn(`⚠️  Sanitise : tool_call sans id (${tc.name}) → id assigné: ${newId}`);
+            const newId = Math.random().toString(36).slice(2, 11);
+            console.warn(`⚠️  Sanitise Passe 0 : tool_call sans id (${tc.name}) → id généré: ${newId}`);
             return { ...tc, id: newId };
         });
-
-        // Fixer additional_kwargs.tool_calls
-        const fixedAK = toolCallsAK.map((tc: any) => {
-            if (tc.id) return tc;
-            const newId = genererToolCallId();
-            return { ...tc, id: newId };
-        });
-
-        // Créer un nouveau AIMessage avec les ids fixés
-        const newMsg = new AIMessage({
+        return new AIMessage({
             content: msg.content,
             tool_calls: fixedToolCalls,
-            additional_kwargs: {
-                ...msg.additional_kwargs,
-                tool_calls: fixedAK.length > 0 ? fixedAK : msg.additional_kwargs?.tool_calls,
-            },
+            additional_kwargs: msg.additional_kwargs,
         });
-        return newMsg;
     });
 
     // ── Passe 1 : ToolMessages orphelins ──
