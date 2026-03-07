@@ -33,22 +33,26 @@ const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, m
 // CLASSIFICATION DES ERREURS API
 
 type ErrorKind =
-    | "QUOTA_EXHAUSTED"  // quota journalier épuisé → skip définitif dans la session
-    | "SKIP"     // erreur de format pour CETTE requête → skip mais provider réutilisable
-    | "RATE_LIMIT"       // trop de requêtes → attendre et réessayer
-    | "RETRYABLE"        // erreur temporaire → réessayer
-    | "FATAL";           // erreur irrécupérable → stopper
+    | "QUOTA_EXHAUSTED"   // quota journalier épuisé → skip définitif dans la session
+    | "MODEL_NOT_FOUND"   // modèle introuvable (404) → skip définitif
+    | "CONTEXT_TOO_LARGE" // requête trop grande pour ce modèle (413) → skip requête seulement
+    | "SKIP"              // erreur de format pour CETTE requête → skip mais provider réutilisable
+    | "RATE_LIMIT"        // trop de requêtes → attendre et réessayer
+    | "RETRYABLE"         // erreur temporaire → réessayer
+    | "FATAL";            // erreur irrécupérable → stopper
 
 function classifierErreur(error: any): ErrorKind {
     const msg    = (error?.message ?? "").toLowerCase();
     const status = error?.status ?? 0;
 
+    // Quota journalier
     if (
         msg.includes("limit: 0") ||
         msg.includes("per_day") ||
         (msg.includes("quota") && msg.includes("exceeded") && msg.includes("day"))
     ) return "QUOTA_EXHAUSTED";
 
+    // Rate limit
     if (
         status === 429 ||
         msg.includes("rate_limit") ||
@@ -58,6 +62,7 @@ function classifierErreur(error: any): ErrorKind {
         (msg.includes("quota") && msg.includes("exceeded") && !msg.includes("day"))
     ) return "RATE_LIMIT";
 
+    // Service indisponible
     if (
         status === 503 ||
         msg.includes("overloaded") ||
@@ -65,36 +70,31 @@ function classifierErreur(error: any): ErrorKind {
         msg.includes("unavailable")
     ) return "RETRYABLE";
 
-    // 404 = modèle introuvable → passer au suivant
+    // Modèle introuvable
     if (status === 404 || msg.includes("model_not_found") || msg.includes("no body")) {
-        return "QUOTA_EXHAUSTED";
+        return "MODEL_NOT_FOUND";
     }
 
-    // 413 = requête trop grande pour ce modèle → passer au suivant
-    // (llama-3.1-8b a une petite fenêtre de contexte ~8K tokens)
+    // Requête trop grande
     if (status === 413 || msg.includes("request too large") || msg.includes("too large")) {
-        return "QUOTA_EXHAUSTED";
+        return "CONTEXT_TOO_LARGE";
     }
 
-    // Cohere : "Missing required key type" = incompatibilité de schema → passer au suivant
-    if (msg.includes("missing required key") || msg.includes("parameterdefinitions")) {
-        return "QUOTA_EXHAUSTED";
-    }
-
-    // Mistral / OpenAI : erreur de FORMAT de message pour cette requête spécifique.
-    // → SKIP_REQUEST (pas QUOTA_EXHAUSTED) : le provider reste disponible pour la prochaine requête.
+    // Erreurs de format (incompatibilité de schéma, tool calls sans id, etc.)
     if (
         msg.includes("tool call id has to be defined") ||
         msg.includes("expected last role") ||
         msg.includes("message_order") ||
         msg.includes("invalid_request_message") ||
         msg.includes("all openai tool calls must have an") ||
-        msg.includes("\"id\" field")
+        msg.includes("\"id\" field") ||
+        msg.includes("missing required key") ||
+        msg.includes("parameterdefinitions")
     ) {
         return "SKIP";
     }
 
-    // Gemini thinking : thought_signature manquant → skip cette requête
+    // Gemini thinking
     if (msg.includes("thought_signature") || msg.includes("missing a thought")) {
         return "SKIP";
     }
@@ -133,22 +133,6 @@ interface ProviderConfig {
     factory: (tools: any[]) => any;
 }
 
-/**
- * Chaîne de fallback — 7 providers, 7 quotas indépendants.
- *
- * ┌──────────────────────────────┬──────┬──────────────┬─────────────────────┐
- * │ Provider / Modèle            │ RPM  │ Req/jour     │ Notes               │
- * ├──────────────────────────────┼──────┼──────────────┼─────────────────────┤
- * │ Gemini 2.0 Flash             │  55  │    1 500     │ Meilleur pour agent │
- * │ Cerebras llama-3.3-70b       │  28  │  illimité    │ Via wrapper OpenAI  │
- * │ Groq llama-3.3-70b           │  25  │   14 400     │                     │
- * │ Cohere command-r             │  20  │    1 000     │                     │
- * │ Groq llama-3.1-8b            │  25  │   14 400 *   │ Quota séparé        │
- * │ Gemini 2.5 Flash             │   9  │      500 *   │ Quota séparé        │
- * │ Mistral small                │   4  │  illimité    │ 1 Md tokens/mois    │
- * │ Gemini gemini-3-flash-preview│   9  │      500 *   │ Dernier recours     │
- * └──────────────────────────────┴──────┴──────────────┴─────────────────────┘
- */
 /**
  * Chaîne de fallback — ordre optimisé par quota/jour puis qualité.
  *
@@ -278,6 +262,7 @@ class MultiProviderLLM {
     // ─────────────────────────────────────────────────────────────────────────
 
     private quotaEpuise      = new Map<number, boolean>();
+    private modelNotFound    = new Map<number, boolean>(); // pour 404
     private rateLimitedUntil = new Map<number, number>();
     private rateLimiters     = new Map<number, RateLimiter>();
     private instances        = new Map<number, any>();
@@ -288,6 +273,7 @@ class MultiProviderLLM {
         PROVIDERS_CHAIN.forEach((p, i) => {
             this.rateLimiters.set(i, new RateLimiter(p.rpm));
             this.quotaEpuise.set(i, false);
+            this.modelNotFound.set(i, false);
             this.rateLimitedUntil.set(i, 0);
         });
     }
@@ -300,11 +286,12 @@ class MultiProviderLLM {
         return this.instances.get(index)!;
     }
 
-    // Retourne le premier provider disponible (non épuisé, non en cooldown)
+    // Retourne le premier provider disponible (non épuisé, non en cooldown, non 404)
     private premierDisponible(): number {
         const now = Date.now();
         for (let i = 0; i < PROVIDERS_CHAIN.length; i++) {
             if (this.quotaEpuise.get(i)) continue;
+            if (this.modelNotFound.get(i)) continue;
             if ((this.rateLimitedUntil.get(i) ?? 0) > now) continue;
             return i;
         }
@@ -328,14 +315,14 @@ class MultiProviderLLM {
 
         if (startIndex < 0) {
             throw new Error(
-                "Tous les providers LLM ont atteint leur quota journalier. " +
+                "Tous les providers LLM ont atteint leur quota journalier ou sont indisponibles. " +
                 "Reessaie demain ou active la facturation sur une cle API."
             );
         }
 
         // Essayer chaque provider disponible dans l'ordre
         for (let i = startIndex; i < PROVIDERS_CHAIN.length; i++) {
-            if (this.quotaEpuise.get(i)) continue;
+            if (this.quotaEpuise.get(i) || this.modelNotFound.get(i)) continue;
 
             const now = Date.now();
             const cooldownUntil = this.rateLimitedUntil.get(i) ?? 0;
@@ -363,15 +350,23 @@ class MultiProviderLLM {
 
                     switch (kind) {
                         case "QUOTA_EXHAUSTED":
-                            // Quota journalier épuisé → marquer définitivement et passer au suivant
                             console.warn(`Quota epuise sur [${config.name}] → skip définitif pour cette session`);
                             this.quotaEpuise.set(i, true);
                             attempt = config.maxRetries;
                             break;
 
+                        case "MODEL_NOT_FOUND":
+                            console.warn(`Modèle introuvable sur [${config.name}] → skip définitif pour cette session`);
+                            this.modelNotFound.set(i, true);
+                            attempt = config.maxRetries;
+                            break;
+
+                        case "CONTEXT_TOO_LARGE":
+                            console.warn(`Contexte trop grand pour [${config.name}] → skip cette requête (provider conservé)`);
+                            attempt = config.maxRetries; // on passe au suivant sans marquer le provider comme épuisé
+                            break;
+
                         case "SKIP":
-                            // Erreur de format pour CETTE requête (ex: tool_call sans id, message_order)
-                            // → skip ce provider pour cette requête UNIQUEMENT, pas définitivement
                             console.warn(`[${config.name}] format incompatible pour cette requête → skip (provider conservé)`);
                             attempt = config.maxRetries;
                             break;
@@ -402,7 +397,7 @@ class MultiProviderLLM {
 
             // Si on sort de la boucle de retries sans succès et sans exception fatale :
             // c'est soit quota épuisé, soit rate limit dépassé → passer au suivant
-            if (!this.quotaEpuise.get(i)) {
+            if (!this.quotaEpuise.get(i) && !this.modelNotFound.get(i)) {
                 console.log(`[${config.name}] retries épuisés → provider suivant`);
             }
             const nextAvail = this.premierDisponible();
@@ -412,7 +407,7 @@ class MultiProviderLLM {
         }
 
         throw new Error(
-            "Tous les providers LLM ont atteint leur quota journalier. " +
+            "Tous les providers LLM ont atteint leur quota journalier ou sont indisponibles. " +
             "Reessaie demain ou active la facturation sur une cle API."
         );
     }
@@ -559,7 +554,7 @@ function construireSystemePrompt(): string {
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SANITISATION DES MESSAGES POUR PROVIDERS STRICTS (Mistral)
+// SANITISATION DES MESSAGES POUR PROVIDERS STRICTS (Mistral, Groq, etc.)
 //
 // Mistral exige :
 //   1. Chaque ToolMessage a un tool_call_id valide avec AIMessage parent
@@ -686,6 +681,17 @@ function sanitiserMessages(messages: BaseMessage[]): BaseMessage[] {
         }
     }
 
+    // ── Passe 5 : s'assurer que le dernier message n'est pas un AIMessage (après toutes modifications) ──
+    if (result.length > 0) {
+        const finalLast = result[result.length - 1];
+        if (finalLast instanceof AIMessage) {
+            result.push(new HumanMessage(
+                "[RELANCE SYSTÈME] Continue la tâche."
+            ));
+            console.warn(`⚠️  Sanitise Passe 5 : HumanMessage de relance ajouté car dernier message était AIMessage`);
+        }
+    }
+
     return result;
 }
 
@@ -723,6 +729,23 @@ async function noeudLLM(etat: typeof EtatAgent.State) {
         const messagesSanitises = sanitiserMessages(allMessages);
         const reponse = await multiLLM.invoke(messagesSanitises);
         console.log("Reponse LLM recue.");
+
+        // --- AJOUT DES IDs MANQUANTS DANS LES TOOL_CALLS ---
+        if (reponse.tool_calls) {
+            for (const tc of reponse.tool_calls) {
+                if (!tc.id) {
+                    tc.id = `call_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
+                }
+            }
+        }
+        if (reponse.additional_kwargs?.tool_calls) {
+            for (const tc of reponse.additional_kwargs.tool_calls) {
+                if (!tc.id) {
+                    tc.id = `call_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
+                }
+            }
+        }
+        // ----------------------------------------------------
 
         // Détection réponse vide : pas de texte ET pas de tool calls
         // Cause : Gemini 2.5 Flash peut retourner un message vide si le contexte
