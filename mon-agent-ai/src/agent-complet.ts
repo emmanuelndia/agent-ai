@@ -171,11 +171,11 @@ const PROVIDERS_CHAIN: ProviderConfig[] = [
     // ── 1. Cerebras llama-3.3-70b — ILLIMITÉ, très capable, 28 RPM
     //       Via wrapper OpenAI-compatible (zéro conflit de dépendance)
     {
-        name: "Cerebras llama-3.3-70b",
+        name: "Cerebras llama3.3-70b",
         rpm: 28,
         maxRetries: 3,
         factory: (tools) => new ChatOpenAI({
-            model: "llama-3.3-70b",
+            model: "llama3.3-70b",
             temperature: 0,
             apiKey: process.env.CEREBRAS_API_KEY,
             configuration: { baseURL: "https://api.cerebras.ai/v1" },
