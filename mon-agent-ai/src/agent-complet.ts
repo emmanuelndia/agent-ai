@@ -33,26 +33,22 @@ const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, m
 // CLASSIFICATION DES ERREURS API
 
 type ErrorKind =
-    | "QUOTA_EXHAUSTED"   // quota journalier épuisé → skip définitif dans la session
-    | "MODEL_NOT_FOUND"   // modèle introuvable (404) → skip définitif
-    | "CONTEXT_TOO_LARGE" // requête trop grande pour ce modèle (413) → skip requête seulement
-    | "SKIP"              // erreur de format pour CETTE requête → skip mais provider réutilisable
-    | "RATE_LIMIT"        // trop de requêtes → attendre et réessayer
-    | "RETRYABLE"         // erreur temporaire → réessayer
-    | "FATAL";            // erreur irrécupérable → stopper
+    | "QUOTA_EXHAUSTED"  // quota journalier épuisé → skip définitif dans la session
+    | "SKIP"     // erreur de format pour CETTE requête → skip mais provider réutilisable
+    | "RATE_LIMIT"       // trop de requêtes → attendre et réessayer
+    | "RETRYABLE"        // erreur temporaire → réessayer
+    | "FATAL";           // erreur irrécupérable → stopper
 
 function classifierErreur(error: any): ErrorKind {
     const msg    = (error?.message ?? "").toLowerCase();
     const status = error?.status ?? 0;
 
-    // Quota journalier
     if (
         msg.includes("limit: 0") ||
         msg.includes("per_day") ||
         (msg.includes("quota") && msg.includes("exceeded") && msg.includes("day"))
     ) return "QUOTA_EXHAUSTED";
 
-    // Rate limit
     if (
         status === 429 ||
         msg.includes("rate_limit") ||
@@ -62,7 +58,6 @@ function classifierErreur(error: any): ErrorKind {
         (msg.includes("quota") && msg.includes("exceeded") && !msg.includes("day"))
     ) return "RATE_LIMIT";
 
-    // Service indisponible
     if (
         status === 503 ||
         msg.includes("overloaded") ||
@@ -70,31 +65,36 @@ function classifierErreur(error: any): ErrorKind {
         msg.includes("unavailable")
     ) return "RETRYABLE";
 
-    // Modèle introuvable
+    // 404 = modèle introuvable → passer au suivant
     if (status === 404 || msg.includes("model_not_found") || msg.includes("no body")) {
-        return "MODEL_NOT_FOUND";
+        return "QUOTA_EXHAUSTED";
     }
 
-    // Requête trop grande
+    // 413 = requête trop grande pour ce modèle → passer au suivant
+    // (llama-3.1-8b a une petite fenêtre de contexte ~8K tokens)
     if (status === 413 || msg.includes("request too large") || msg.includes("too large")) {
-        return "CONTEXT_TOO_LARGE";
+        return "QUOTA_EXHAUSTED";
     }
 
-    // Erreurs de format (incompatibilité de schéma, tool calls sans id, etc.)
+    // Cohere : "Missing required key type" = incompatibilité de schema → passer au suivant
+    if (msg.includes("missing required key") || msg.includes("parameterdefinitions")) {
+        return "QUOTA_EXHAUSTED";
+    }
+
+    // Mistral / OpenAI : erreur de FORMAT de message pour cette requête spécifique.
+    // → SKIP_REQUEST (pas QUOTA_EXHAUSTED) : le provider reste disponible pour la prochaine requête.
     if (
         msg.includes("tool call id has to be defined") ||
         msg.includes("expected last role") ||
         msg.includes("message_order") ||
         msg.includes("invalid_request_message") ||
         msg.includes("all openai tool calls must have an") ||
-        msg.includes("\"id\" field") ||
-        msg.includes("missing required key") ||
-        msg.includes("parameterdefinitions")
+        msg.includes("\"id\" field")
     ) {
         return "SKIP";
     }
 
-    // Gemini thinking
+    // Gemini thinking : thought_signature manquant → skip cette requête
     if (msg.includes("thought_signature") || msg.includes("missing a thought")) {
         return "SKIP";
     }
@@ -155,11 +155,11 @@ const PROVIDERS_CHAIN: ProviderConfig[] = [
     // ── 1. Cerebras llama-3.3-70b — ILLIMITÉ, très capable, 28 RPM
     //       Via wrapper OpenAI-compatible (zéro conflit de dépendance)
     {
-        name: "Cerebras llama3.3-70b",
+        name: "Cerebras llama-3.3-70b",
         rpm: 28,
         maxRetries: 3,
         factory: (tools) => new ChatOpenAI({
-            model: "llama3.3-70b",
+            model: "llama-3.3-70b",
             temperature: 0,
             apiKey: process.env.CEREBRAS_API_KEY,
             configuration: { baseURL: "https://api.cerebras.ai/v1" },
@@ -262,7 +262,6 @@ class MultiProviderLLM {
     // ─────────────────────────────────────────────────────────────────────────
 
     private quotaEpuise      = new Map<number, boolean>();
-    private modelNotFound    = new Map<number, boolean>(); // pour 404
     private rateLimitedUntil = new Map<number, number>();
     private rateLimiters     = new Map<number, RateLimiter>();
     private instances        = new Map<number, any>();
@@ -273,7 +272,6 @@ class MultiProviderLLM {
         PROVIDERS_CHAIN.forEach((p, i) => {
             this.rateLimiters.set(i, new RateLimiter(p.rpm));
             this.quotaEpuise.set(i, false);
-            this.modelNotFound.set(i, false);
             this.rateLimitedUntil.set(i, 0);
         });
     }
@@ -286,12 +284,11 @@ class MultiProviderLLM {
         return this.instances.get(index)!;
     }
 
-    // Retourne le premier provider disponible (non épuisé, non en cooldown, non 404)
+    // Retourne le premier provider disponible (non épuisé, non en cooldown)
     private premierDisponible(): number {
         const now = Date.now();
         for (let i = 0; i < PROVIDERS_CHAIN.length; i++) {
             if (this.quotaEpuise.get(i)) continue;
-            if (this.modelNotFound.get(i)) continue;
             if ((this.rateLimitedUntil.get(i) ?? 0) > now) continue;
             return i;
         }
@@ -315,14 +312,14 @@ class MultiProviderLLM {
 
         if (startIndex < 0) {
             throw new Error(
-                "Tous les providers LLM ont atteint leur quota journalier ou sont indisponibles. " +
+                "Tous les providers LLM ont atteint leur quota journalier. " +
                 "Reessaie demain ou active la facturation sur une cle API."
             );
         }
 
         // Essayer chaque provider disponible dans l'ordre
         for (let i = startIndex; i < PROVIDERS_CHAIN.length; i++) {
-            if (this.quotaEpuise.get(i) || this.modelNotFound.get(i)) continue;
+            if (this.quotaEpuise.get(i)) continue;
 
             const now = Date.now();
             const cooldownUntil = this.rateLimitedUntil.get(i) ?? 0;
@@ -350,23 +347,15 @@ class MultiProviderLLM {
 
                     switch (kind) {
                         case "QUOTA_EXHAUSTED":
+                            // Quota journalier épuisé → marquer définitivement et passer au suivant
                             console.warn(`Quota epuise sur [${config.name}] → skip définitif pour cette session`);
                             this.quotaEpuise.set(i, true);
                             attempt = config.maxRetries;
                             break;
 
-                        case "MODEL_NOT_FOUND":
-                            console.warn(`Modèle introuvable sur [${config.name}] → skip définitif pour cette session`);
-                            this.modelNotFound.set(i, true);
-                            attempt = config.maxRetries;
-                            break;
-
-                        case "CONTEXT_TOO_LARGE":
-                            console.warn(`Contexte trop grand pour [${config.name}] → skip cette requête (provider conservé)`);
-                            attempt = config.maxRetries; // on passe au suivant sans marquer le provider comme épuisé
-                            break;
-
                         case "SKIP":
+                            // Erreur de format pour CETTE requête (ex: tool_call sans id, message_order)
+                            // → skip ce provider pour cette requête UNIQUEMENT, pas définitivement
                             console.warn(`[${config.name}] format incompatible pour cette requête → skip (provider conservé)`);
                             attempt = config.maxRetries;
                             break;
@@ -397,7 +386,7 @@ class MultiProviderLLM {
 
             // Si on sort de la boucle de retries sans succès et sans exception fatale :
             // c'est soit quota épuisé, soit rate limit dépassé → passer au suivant
-            if (!this.quotaEpuise.get(i) && !this.modelNotFound.get(i)) {
+            if (!this.quotaEpuise.get(i)) {
                 console.log(`[${config.name}] retries épuisés → provider suivant`);
             }
             const nextAvail = this.premierDisponible();
@@ -407,7 +396,7 @@ class MultiProviderLLM {
         }
 
         throw new Error(
-            "Tous les providers LLM ont atteint leur quota journalier ou sont indisponibles. " +
+            "Tous les providers LLM ont atteint leur quota journalier. " +
             "Reessaie demain ou active la facturation sur une cle API."
         );
     }
@@ -554,7 +543,7 @@ function construireSystemePrompt(): string {
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SANITISATION DES MESSAGES POUR PROVIDERS STRICTS (Mistral, Groq, etc.)
+// SANITISATION DES MESSAGES POUR PROVIDERS STRICTS (Mistral)
 //
 // Mistral exige :
 //   1. Chaque ToolMessage a un tool_call_id valide avec AIMessage parent
@@ -564,52 +553,66 @@ function construireSystemePrompt(): string {
 function sanitiserMessages(messages: BaseMessage[]): BaseMessage[] {
 
     // ═══════════════════════════════════════════════════════════════════════
-    // POURQUOI SUPPRIMER PLUTÔT QUE PATCHER :
+    // PASSE 0 — Normalisation des AIMessages avec tool_calls
     //
-    // Quand Gemini génère un AIMessage avec tool_calls sans id :
-    //   - msg.tool_calls[].id = undefined
-    //   - msg.additional_kwargs.tool_calls[].id = undefined  ← Groq lit CELUI-CI
-    //   - Les ToolMessages exécutés ont tool_call_id = undefined
+    // PROBLÈME ROOT CAUSE :
+    //   Gemini génère un AIMessage où :
+    //     • msg.tool_calls[i].id   = "abc123"  ← LangChain (OK)
+    //     • msg.additional_kwargs.tool_calls[i] = format Gemini, sans "id"
+    //   Groq/Mistral sérialisent via additional_kwargs.tool_calls (format
+    //   OpenAI brut) → voient des ids manquants → plantent.
     //
-    // Patcher les ids sur tool_calls ne suffit pas : Groq sérialise via
-    // additional_kwargs.tool_calls (format OpenAI brut), pas via tool_calls.
-    // Et les ToolMessages fils ont déjà tool_call_id=undefined → impossible
-    // de les matcher même avec de nouveaux ids inventés.
-    //
-    // Solution : supprimer le groupe AIMessage(sans id) + ses ToolMessages.
+    // STRATÉGIE :
+    //   • ids manquants dans tool_calls → supprimer AIMessage + ToolMessages
+    //   • ids présents dans tool_calls  → RECONSTRUIRE additional_kwargs en
+    //     format OpenAI standard, en copiant les ids depuis tool_calls
     // ═══════════════════════════════════════════════════════════════════════
 
-    // ── Passe 0 : supprimer les AIMessages avec tool_calls sans id + leurs ToolMessages ──
     const pass0: BaseMessage[] = [];
     let i = 0;
     while (i < messages.length) {
         const msg = messages[i];
 
         if (msg instanceof AIMessage) {
-            const toolCalls    = msg.tool_calls ?? [];
-            const toolCallsAK  = (msg.additional_kwargs?.tool_calls as any[]) ?? [];
+            const toolCalls   = msg.tool_calls ?? [];
+            const toolCallsAK = (msg.additional_kwargs?.tool_calls as any[]) ?? [];
+            const hasTools    = toolCalls.length > 0 || toolCallsAK.length > 0;
 
-            // Un tool_call est "sans id" si tool_calls OU additional_kwargs.tool_calls
-            // contiennent une entrée sans id (Groq vérifie les deux)
-            const hasToolCalls = toolCalls.length > 0 || toolCallsAK.length > 0;
-            const missingId    =
-                toolCalls.some(tc => !tc.id) ||
-                toolCallsAK.some((tc: any) => !tc.id);
+            if (hasTools) {
+                // Cas 1 : ids manquants → supprimer ce message + ses ToolMessages
+                const missingId =
+                    toolCalls.some(tc => !tc.id) ||
+                    toolCallsAK.some((tc: any) => !tc.id);
 
-            if (hasToolCalls && missingId) {
-                // Compter les ToolMessages suivants à supprimer avec ce groupe
-                let j = i + 1;
-                let skipped = 0;
-                while (j < messages.length && messages[j] instanceof ToolMessage) {
-                    j++;
-                    skipped++;
+                if (missingId) {
+                    let j = i + 1, skipped = 0;
+                    while (j < messages.length && messages[j] instanceof ToolMessage) { j++; skipped++; }
+                    console.warn(`⚠️  Sanitise P0 : AIMessage sans id supprimé${skipped > 0 ? ` + ${skipped} ToolMessage(s)` : ""}`);
+                    i = j;
+                    continue;
                 }
-                console.warn(
-                    `⚠️  Sanitise Passe 0 : AIMessage avec tool_calls sans id supprimé` +
-                    (skipped > 0 ? ` + ${skipped} ToolMessage(s) liés` : "")
-                );
-                i = j; // sauter l'AIMessage + ses ToolMessages
-                continue;
+
+                // Cas 2 : ids présents dans tool_calls → normaliser additional_kwargs
+                // en format OpenAI standard pour que Groq/Mistral le lisent correctement
+                if (toolCalls.length > 0) {
+                    const akNormalisé = toolCalls.map(tc => ({
+                        id      : tc.id!,
+                        type    : "function" as const,
+                        function: {
+                            name     : tc.name,
+                            arguments: typeof tc.args === "string"
+                                ? tc.args
+                                : JSON.stringify(tc.args ?? {}),
+                        },
+                    }));
+                    pass0.push(new AIMessage({
+                        content          : msg.content,
+                        tool_calls       : toolCalls,
+                        additional_kwargs: { ...msg.additional_kwargs, tool_calls: akNormalisé },
+                    }));
+                    i++;
+                    continue;
+                }
             }
         }
 
@@ -617,7 +620,7 @@ function sanitiserMessages(messages: BaseMessage[]): BaseMessage[] {
         i++;
     }
 
-    // ── Passe 1 : ToolMessages orphelins (sans AIMessage parent valide) ──
+    // ── Passe 1 : ToolMessages orphelins ──
     const pass1: BaseMessage[] = [];
     for (const msg of pass0) {
         if (msg instanceof ToolMessage) {
@@ -627,7 +630,7 @@ function sanitiserMessages(messages: BaseMessage[]): BaseMessage[] {
                 ((prev.additional_kwargs?.tool_calls as any[])?.length ?? 0) > 0
             );
             if (!hasParent || !msg.tool_call_id) {
-                console.warn(`⚠️  Sanitise Passe 1 : ToolMessage orphelin ignoré (id: ${msg.tool_call_id ?? "undefined"})`);
+                console.warn(`⚠️  Sanitise : ToolMessage orphelin ignoré (id: ${msg.tool_call_id ?? "undefined"})`);
                 continue;
             }
         }
@@ -644,7 +647,7 @@ function sanitiserMessages(messages: BaseMessage[]): BaseMessage[] {
             ((msg.additional_kwargs?.tool_calls as any[])?.length ?? 0) > 0
         );
         if (isAIWithTools && !(next instanceof ToolMessage)) {
-            console.warn(`⚠️  Sanitise Passe 2 : AIMessage avec tool_calls sans ToolMessage suivant supprimé`);
+            console.warn(`⚠️  Sanitise : AIMessage avec tool_calls sans ToolMessage suivant ignoré`);
             continue;
         }
         pass2.push(msg);
@@ -659,36 +662,29 @@ function sanitiserMessages(messages: BaseMessage[]): BaseMessage[] {
             ((last.additional_kwargs?.tool_calls as any[])?.length ?? 0) > 0
         );
         if (isTrailingToolAI) {
-            console.warn(`⚠️  Sanitise Passe 3 : AIMessage terminal avec tool_calls supprimé`);
+            console.warn(`⚠️  Sanitise : AIMessage terminal avec tool_calls supprimé`);
             result.pop();
         } else {
             break;
         }
     }
 
-    // ── Passe 4 : Mistral/Cohere refusent si le DERNIER message est un AIMessage ──
+    // ── Passe 4 : Mistral refuse si le DERNIER message est un AIMessage (même sans tool_calls)
+    // Après suppression des orphelins, le contexte peut se terminer sur un AIMessage.
+    // On ajoute un HumanMessage invisible pour satisfaire la contrainte de rôle.
     const last = result.at(-1);
     if (last instanceof AIMessage) {
         const lastText = String(last.content ?? "").trim();
         if (!lastText) {
+            // AIMessage vide en fin → le retirer directement
             result.pop();
-            console.warn(`⚠️  Sanitise Passe 4 : AIMessage vide terminal supprimé`);
+            console.warn(`⚠️  Sanitise : AIMessage vide terminal supprimé`);
         } else {
+            // AIMessage avec contenu → ajouter un Human "relance"
             result.push(new HumanMessage(
                 "[RELANCE SYSTÈME] Reprends la tâche là où tu t'es arrêté."
             ));
-            console.warn(`⚠️  Sanitise Passe 4 : HumanMessage de relance ajouté`);
-        }
-    }
-
-    // ── Passe 5 : s'assurer que le dernier message n'est pas un AIMessage (après toutes modifications) ──
-    if (result.length > 0) {
-        const finalLast = result[result.length - 1];
-        if (finalLast instanceof AIMessage) {
-            result.push(new HumanMessage(
-                "[RELANCE SYSTÈME] Continue la tâche."
-            ));
-            console.warn(`⚠️  Sanitise Passe 5 : HumanMessage de relance ajouté car dernier message était AIMessage`);
+            console.warn(`⚠️  Sanitise : HumanMessage de relance ajouté (contexte terminait sur AIMessage)`);
         }
     }
 
@@ -729,23 +725,6 @@ async function noeudLLM(etat: typeof EtatAgent.State) {
         const messagesSanitises = sanitiserMessages(allMessages);
         const reponse = await multiLLM.invoke(messagesSanitises);
         console.log("Reponse LLM recue.");
-
-        // --- AJOUT DES IDs MANQUANTS DANS LES TOOL_CALLS ---
-        if (reponse.tool_calls) {
-            for (const tc of reponse.tool_calls) {
-                if (!tc.id) {
-                    tc.id = `call_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
-                }
-            }
-        }
-        if (reponse.additional_kwargs?.tool_calls) {
-            for (const tc of reponse.additional_kwargs.tool_calls) {
-                if (!tc.id) {
-                    tc.id = `call_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
-                }
-            }
-        }
-        // ----------------------------------------------------
 
         // Détection réponse vide : pas de texte ET pas de tool calls
         // Cause : Gemini 2.5 Flash peut retourner un message vide si le contexte
