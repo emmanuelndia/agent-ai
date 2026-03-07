@@ -539,11 +539,57 @@ function construireSystemePrompt(): string {
 //   2. Dernier message = Human ou Tool (jamais AI)
 // ─────────────────────────────────────────────────────────────────────────────
 
+function genererToolCallId(): string {
+    return Math.random().toString(36).slice(2, 11);
+}
+
 function sanitiserMessages(messages: BaseMessage[]): BaseMessage[] {
+
+    // ── Passe 0 : garantir que tous les tool_calls dans les AIMessages ont un id ──
+    // Groq (wrapper OpenAI) exige un "id" sur chaque tool_call.
+    // Gemini et d'autres providers peuvent générer des tool_calls sans id.
+    // On assigne un id généré si manquant, plutôt que de supprimer le message.
+    const pass0: BaseMessage[] = messages.map(msg => {
+        if (!(msg instanceof AIMessage)) return msg;
+
+        const toolCalls = msg.tool_calls ?? [];
+        const toolCallsAK = (msg.additional_kwargs?.tool_calls as any[]) ?? [];
+        const needsFix =
+            toolCalls.some(tc => !tc.id) ||
+            toolCallsAK.some((tc: any) => !tc.id);
+
+        if (!needsFix) return msg;
+
+        // Fixer tool_calls
+        const fixedToolCalls = toolCalls.map(tc => {
+            if (tc.id) return tc;
+            const newId = genererToolCallId();
+            console.warn(`⚠️  Sanitise : tool_call sans id (${tc.name}) → id assigné: ${newId}`);
+            return { ...tc, id: newId };
+        });
+
+        // Fixer additional_kwargs.tool_calls
+        const fixedAK = toolCallsAK.map((tc: any) => {
+            if (tc.id) return tc;
+            const newId = genererToolCallId();
+            return { ...tc, id: newId };
+        });
+
+        // Créer un nouveau AIMessage avec les ids fixés
+        const newMsg = new AIMessage({
+            content: msg.content,
+            tool_calls: fixedToolCalls,
+            additional_kwargs: {
+                ...msg.additional_kwargs,
+                tool_calls: fixedAK.length > 0 ? fixedAK : msg.additional_kwargs?.tool_calls,
+            },
+        });
+        return newMsg;
+    });
 
     // ── Passe 1 : ToolMessages orphelins ──
     const pass1: BaseMessage[] = [];
-    for (const msg of messages) {
+    for (const msg of pass0) {
         if (msg instanceof ToolMessage) {
             const prev = pass1.at(-1);
             const hasParent = prev instanceof AIMessage && (
