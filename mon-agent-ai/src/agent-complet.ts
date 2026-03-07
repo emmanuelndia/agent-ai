@@ -89,7 +89,7 @@ function classifierErreur(error: any): ErrorKind {
         msg.includes("message_order") ||
         msg.includes("invalid_request_message") ||
         msg.includes("all openai tool calls must have an") ||
-        msg.includes("id" field")
+        msg.includes("\"id\" field")
     ) {
         return "SKIP";
     }
