@@ -183,10 +183,10 @@ const PROVIDERS_CHAIN: ProviderConfig[] = [
         }).bindTools(tools),
     },
 
-    // ── 3. Groq llama-3.3-70b — 14 400 req/jour, très capable, 25 RPM
+    // ── 3. Groq llama-3.3-70b — 14 400 req/jour, très capable, 15 RPM (réduit pour éviter 429)
     {
         name: "Groq llama-3.3-70b",
-        rpm: 25,
+        rpm: 15,
         maxRetries: 3,
         factory: (tools) => new ChatGroq({
             model: "llama-3.3-70b-versatile",
@@ -196,10 +196,10 @@ const PROVIDERS_CHAIN: ProviderConfig[] = [
         }).bindTools(tools),
     },
 
-    // ── 4. Groq llama-3.1-8b — quota SÉPARÉ du 3.3-70b
+    // ── 4. Groq llama-3.1-8b — quota SÉPARÉ du 3.3-70b (15 RPM réduit)
     {
         name: "Groq llama-3.1-8b",
-        rpm: 25,
+        rpm: 15,
         maxRetries: 3,
         factory: (tools) => new ChatGroq({
             model: "llama-3.1-8b-instant",
@@ -469,10 +469,10 @@ const llmPourContexte = new ChatGoogleGenerativeAI({
 }) as any;
 
 const contextConfig: ContextConfig = {
-    maxTokens: 28000,
-    compressionThreshold: 0.75,
-    summaryInterval: 8,
-    keepLastNMessages: 6,
+    maxTokens: 12000, // Réduit pour mieux supporter Groq llama-3.1-8b (8k-12k context)
+    compressionThreshold: 0.7, // Plus agressif
+    summaryInterval: 6, // Résumé plus fréquent
+    keepLastNMessages: 4, // Moins de messages récents pour libérer de la place
 };
 export const contextManager = new AdvancedContextManager(contextConfig, llmPourContexte);
 
@@ -673,20 +673,24 @@ function sanitiserMessages(messages: BaseMessage[]): BaseMessage[] {
     }
 
     // ── Passe 1 : ToolMessages orphelins ──
+    // On garde une trace des IDs de tool_calls valides vus dans les AIMessages
+    const validToolCallIds = new Set<string>();
     const pass1: BaseMessage[] = [];
+    
     for (const msg of pass0) {
-        if (msg instanceof ToolMessage) {
-            const prev = pass1.at(-1);
-            const hasParent = prev instanceof AIMessage && (
-                (prev.tool_calls?.length ?? 0) > 0 ||
-                ((prev.additional_kwargs?.tool_calls as any[])?.length ?? 0) > 0
-            );
-            if (!hasParent || !msg.tool_call_id) {
+        if (msg instanceof AIMessage) {
+            (msg.tool_calls ?? []).forEach(tc => { if (tc.id) validToolCallIds.add(tc.id); });
+            ((msg.additional_kwargs?.tool_calls as any[]) ?? []).forEach(tc => { if (tc.id) validToolCallIds.add(tc.id); });
+            pass1.push(msg);
+        } else if (msg instanceof ToolMessage) {
+            if (!msg.tool_call_id || !validToolCallIds.has(msg.tool_call_id)) {
                 console.warn(`⚠️  Sanitise P1 : ToolMessage orphelin ignoré (id: ${msg.tool_call_id ?? "undefined"})`);
                 continue;
             }
+            pass1.push(msg);
+        } else {
+            pass1.push(msg);
         }
-        pass1.push(msg);
     }
 
     // ── Passe 2 : AIMessages avec tool_calls sans ToolMessage suivant ──
