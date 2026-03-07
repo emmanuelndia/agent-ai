@@ -568,36 +568,61 @@ function construireSystemePrompt(): string {
 
 function sanitiserMessages(messages: BaseMessage[]): BaseMessage[] {
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // POURQUOI SUPPRIMER PLUTÔT QUE PATCHER :
+    //
+    // Quand Gemini génère un AIMessage avec tool_calls sans id :
+    //   - msg.tool_calls[].id = undefined
+    //   - msg.additional_kwargs.tool_calls[].id = undefined  ← Groq lit CELUI-CI
+    //   - Les ToolMessages exécutés ont tool_call_id = undefined
+    //
+    // Patcher les ids sur tool_calls ne suffit pas : Groq sérialise via
+    // additional_kwargs.tool_calls (format OpenAI brut), pas via tool_calls.
+    // Et les ToolMessages fils ont déjà tool_call_id=undefined → impossible
+    // de les matcher même avec de nouveaux ids inventés.
+    //
+    // Solution : supprimer le groupe AIMessage(sans id) + ses ToolMessages.
+    // ═══════════════════════════════════════════════════════════════════════
 
-    // ── Passe 0 : garantir que tous les tool_calls ont un id ──
-    // Groq/OpenAI exigent un "id" sur chaque tool_call.
-    // Gemini peut générer des tool_calls sans id → on en assigne un.
-    const pass0: BaseMessage[] = messages.map(msg => {
-        if (!(msg instanceof AIMessage)) return msg;
-        const toolCalls = msg.tool_calls ?? [];
-        const needsFix  = toolCalls.some(tc => !tc.id);
-        if (!needsFix) return msg;
-        const fixedToolCalls = toolCalls.map(tc => {
-            if (tc.id) return tc;
-            const newId = Math.random().toString(36).slice(2, 11);
-            console.warn(`⚠️  Sanitise Passe 0 : tool_call sans id (${tc.name}) → id généré: ${newId}`);
-            return { ...tc, id: newId };
-        });
-        // Vérification : si l'id n'est toujours pas assignable, nettoyer les tool_calls
-        // (Groq rejette en FATAL tout AIMessage avec un tool_call sans id)
-        const stillBroken = fixedToolCalls.some((tc: any) => !tc.id);
-        if (stillBroken) {
-            console.warn(`⚠️  Sanitise Passe 0 : tool_calls irrécupérables → AIMessage nettoyé`);
-            return new AIMessage({ content: String(msg.content ?? ""), tool_calls: [] });
+    // ── Passe 0 : supprimer les AIMessages avec tool_calls sans id + leurs ToolMessages ──
+    const pass0: BaseMessage[] = [];
+    let i = 0;
+    while (i < messages.length) {
+        const msg = messages[i];
+
+        if (msg instanceof AIMessage) {
+            const toolCalls    = msg.tool_calls ?? [];
+            const toolCallsAK  = (msg.additional_kwargs?.tool_calls as any[]) ?? [];
+
+            // Un tool_call est "sans id" si tool_calls OU additional_kwargs.tool_calls
+            // contiennent une entrée sans id (Groq vérifie les deux)
+            const hasToolCalls = toolCalls.length > 0 || toolCallsAK.length > 0;
+            const missingId    =
+                toolCalls.some(tc => !tc.id) ||
+                toolCallsAK.some((tc: any) => !tc.id);
+
+            if (hasToolCalls && missingId) {
+                // Compter les ToolMessages suivants à supprimer avec ce groupe
+                let j = i + 1;
+                let skipped = 0;
+                while (j < messages.length && messages[j] instanceof ToolMessage) {
+                    j++;
+                    skipped++;
+                }
+                console.warn(
+                    `⚠️  Sanitise Passe 0 : AIMessage avec tool_calls sans id supprimé` +
+                    (skipped > 0 ? ` + ${skipped} ToolMessage(s) liés` : "")
+                );
+                i = j; // sauter l'AIMessage + ses ToolMessages
+                continue;
+            }
         }
-        return new AIMessage({
-            content: msg.content,
-            tool_calls: fixedToolCalls,
-            additional_kwargs: msg.additional_kwargs,
-        });
-    });
 
-    // ── Passe 1 : ToolMessages orphelins ──
+        pass0.push(msg);
+        i++;
+    }
+
+    // ── Passe 1 : ToolMessages orphelins (sans AIMessage parent valide) ──
     const pass1: BaseMessage[] = [];
     for (const msg of pass0) {
         if (msg instanceof ToolMessage) {
@@ -607,7 +632,7 @@ function sanitiserMessages(messages: BaseMessage[]): BaseMessage[] {
                 ((prev.additional_kwargs?.tool_calls as any[])?.length ?? 0) > 0
             );
             if (!hasParent || !msg.tool_call_id) {
-                console.warn(`⚠️  Sanitise : ToolMessage orphelin ignoré (id: ${msg.tool_call_id ?? "undefined"})`);
+                console.warn(`⚠️  Sanitise Passe 1 : ToolMessage orphelin ignoré (id: ${msg.tool_call_id ?? "undefined"})`);
                 continue;
             }
         }
@@ -624,7 +649,7 @@ function sanitiserMessages(messages: BaseMessage[]): BaseMessage[] {
             ((msg.additional_kwargs?.tool_calls as any[])?.length ?? 0) > 0
         );
         if (isAIWithTools && !(next instanceof ToolMessage)) {
-            console.warn(`⚠️  Sanitise : AIMessage avec tool_calls sans ToolMessage suivant ignoré`);
+            console.warn(`⚠️  Sanitise Passe 2 : AIMessage avec tool_calls sans ToolMessage suivant supprimé`);
             continue;
         }
         pass2.push(msg);
@@ -639,29 +664,25 @@ function sanitiserMessages(messages: BaseMessage[]): BaseMessage[] {
             ((last.additional_kwargs?.tool_calls as any[])?.length ?? 0) > 0
         );
         if (isTrailingToolAI) {
-            console.warn(`⚠️  Sanitise : AIMessage terminal avec tool_calls supprimé`);
+            console.warn(`⚠️  Sanitise Passe 3 : AIMessage terminal avec tool_calls supprimé`);
             result.pop();
         } else {
             break;
         }
     }
 
-    // ── Passe 4 : Mistral refuse si le DERNIER message est un AIMessage (même sans tool_calls)
-    // Après suppression des orphelins, le contexte peut se terminer sur un AIMessage.
-    // On ajoute un HumanMessage invisible pour satisfaire la contrainte de rôle.
+    // ── Passe 4 : Mistral/Cohere refusent si le DERNIER message est un AIMessage ──
     const last = result.at(-1);
     if (last instanceof AIMessage) {
         const lastText = String(last.content ?? "").trim();
         if (!lastText) {
-            // AIMessage vide en fin → le retirer directement
             result.pop();
-            console.warn(`⚠️  Sanitise : AIMessage vide terminal supprimé`);
+            console.warn(`⚠️  Sanitise Passe 4 : AIMessage vide terminal supprimé`);
         } else {
-            // AIMessage avec contenu → ajouter un Human "relance"
             result.push(new HumanMessage(
                 "[RELANCE SYSTÈME] Reprends la tâche là où tu t'es arrêté."
             ));
-            console.warn(`⚠️  Sanitise : HumanMessage de relance ajouté (contexte terminait sur AIMessage)`);
+            console.warn(`⚠️  Sanitise Passe 4 : HumanMessage de relance ajouté`);
         }
     }
 
