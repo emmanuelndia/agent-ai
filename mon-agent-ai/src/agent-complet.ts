@@ -136,22 +136,6 @@ interface ProviderConfig {
 }
 
 /**
- * Chaîne de fallback — 7 providers, 7 quotas indépendants.
- *
- * ┌──────────────────────────────┬──────┬──────────────┬─────────────────────┐
- * │ Provider / Modèle            │ RPM  │ Req/jour     │ Notes               │
- * ├──────────────────────────────┼──────┼──────────────┼─────────────────────┤
- * │ Gemini 2.0 Flash             │  55  │    1 500     │ Meilleur pour agent │
- * │ Cerebras llama-3.3-70b       │  28  │  illimité    │ Via wrapper OpenAI  │
- * │ Groq llama-3.3-70b           │  25  │   14 400     │                     │
- * │ Cohere command-r             │  20  │    1 000     │                     │
- * │ Groq llama-3.1-8b            │  25  │   14 400 *   │ Quota séparé        │
- * │ Gemini 2.5 Flash             │   9  │      500 *   │ Quota séparé        │
- * │ Mistral small                │   4  │  illimité    │ 1 Md tokens/mois    │
- * │ Gemini gemini-3-flash-preview│   9  │      500 *   │ Dernier recours     │
- * └──────────────────────────────┴──────┴──────────────┴─────────────────────┘
- */
-/**
  * Chaîne de fallback — ordre optimisé par quota/jour puis qualité.
  *
  * STRATÉGIE : illimités en tête, quotas limités en dernier recours.
@@ -177,7 +161,7 @@ const PROVIDERS_CHAIN: ProviderConfig[] = [
         rpm: 28,
         maxRetries: 3,
         factory: (tools) => new ChatOpenAI({
-            model: "llama-3.3-70b",
+            model: "llama3.3-70b",
             temperature: 0,
             apiKey: process.env.CEREBRAS_API_KEY,
             configuration: { baseURL: "https://api.cerebras.ai/v1" },
@@ -413,10 +397,18 @@ class MultiProviderLLM {
             }
         }
 
-        throw new Error(
-            "Tous les providers LLM ont atteint leur quota journalier. " +
-            "Reessaie demain ou active la facturation sur une cle API."
-        );
+        // Compter les providers vraiment épuisés vs ceux qui ont juste SKIPpé
+        let nbEpuises = 0;
+        this.quotaEpuise.forEach(v => { if (v) nbEpuises++; });
+        if (nbEpuises === PROVIDERS_CHAIN.length) {
+            throw new Error(
+                "Tous les providers LLM ont atteint leur quota journalier. " +
+                "Reessaie demain ou active la facturation sur une cle API."
+            );
+        } else {
+            // Tous ont SKIPpé → le contexte est trop cassé pour tous les providers
+            throw new Error("CONTEXT_INCOMPATIBLE");
+        }
     }
 }
 
@@ -817,7 +809,23 @@ async function noeudLLM(etat: typeof EtatAgent.State) {
 
     } catch (error: any) {
         console.error("Erreur definitive noeudLLM:", error?.message);
-        // PRINCIPE MANUS : garder les erreurs dans le contexte.
+
+        // Contexte trop cassé (tous les providers ont SKIPpé) → fallback nucléaire
+        // On réessaie avec uniquement le dernier message humain, contexte vide
+        if (error?.message === "CONTEXT_INCOMPATIBLE") {
+            console.warn("⚠️  FALLBACK NUCLÉAIRE : contexte réinitialisé, relance sur message brut");
+            const dernierHuman = etat.messages.filter(m => m instanceof HumanMessage).at(-1);
+            if (dernierHuman) {
+                try {
+                    const reponseNucleaire = await multiLLM.invoke([dernierHuman]);
+                    console.log("Réponse fallback nucléaire reçue.");
+                    return { messages: [reponseNucleaire] };
+                } catch (e2: any) {
+                    console.error("Fallback nucléaire échoué:", e2?.message);
+                }
+            }
+        }
+
         const isQuotaEpuise = error?.message?.includes("Tous les providers");
         const messageErreur = isQuotaEpuise
             ? "ERREUR QUOTA : Tous les providers LLM sont epuises. Attendre demain."
