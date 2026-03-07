@@ -8,24 +8,26 @@ const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
 // Déclaration des variables qui contiendront l'agent
-let traiterMessage: (message: string) => Promise<string>;
+let traiterMessage: (message: string) => Promise<{ text: string; screenshot?: string }>;
 let contextManager: any;
 let agentReady = false;
 let agentLoadingPromise: Promise<void>;
 
 // Fonction de chargement de l'agent
 async function loadAgent() {
-  try {
-    // Utilisation de import() dynamique (compatible ES module)
-    const agent = await import('./agent-complet.js');
-    traiterMessage = agent.traiterMessage;
-    contextManager = agent.contextManager;
-    agentReady = true;  
-    console.log("✅ Logique IA chargée avec succès");
-  } catch (err) {
-    console.error("❌ Erreur chargement IA:", err);
-    agentReady = false;
+  // Pas de try/catch : si l'import échoue la promise rejette vraiment
+  // → ensureAgentReady peut détecter l'échec et retourner 503
+  const agent = await import('./agent-complet.js');
+  traiterMessage = agent.traiterMessage;
+  contextManager = agent.contextManager;
+  if (typeof traiterMessage !== 'function') {
+    throw new Error(
+      `traiterMessage n'est pas une fonction (reçu: ${typeof traiterMessage}). ` +
+      `Vérifier les exports de agent-complet.ts`
+    );
   }
+  agentReady = true;
+  console.log("✅ Logique IA chargée avec succès");
 }
 
 // Démarrer le chargement immédiatement (sans bloquer le démarrage du serveur)
@@ -63,15 +65,28 @@ app.listen(PORT, '0.0.0.0', () => {
 // Middleware pour s'assurer que l'agent est prêt avant les routes qui en ont besoin
 async function ensureAgentReady(req: Request, res: Response, next: Function) {
   if (!agentReady) {
-    // On attend que le chargement soit fini (jusqu'à 10s)
     try {
       await Promise.race([
         agentLoadingPromise,
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout chargement agent')), 10000))
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout 10s')), 10000))
       ]);
-    } catch (err) {
-      return res.status(503).json({ error: 'Agent non disponible, veuillez réessayer plus tard' });
+    } catch (err: any) {
+      // Première tentative échouée → retry
+      console.error("⚠️  Premier chargement échoué, retry...", err?.message);
+      try {
+        agentLoadingPromise = loadAgent();
+        await Promise.race([
+          agentLoadingPromise,
+          new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout retry 15s')), 15000))
+        ]);
+      } catch (err2: any) {
+        return res.status(503).json({ error: 'Agent non disponible', detail: err2?.message });
+      }
     }
+  }
+  // Vérification finale : même si la promise a résolu, la fonction doit exister
+  if (!agentReady || typeof traiterMessage !== 'function') {
+    return res.status(503).json({ error: 'Agent non initialisé correctement' });
   }
   next();
 }

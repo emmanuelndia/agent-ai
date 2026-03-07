@@ -1,348 +1,1034 @@
-import { Sandbox } from '@e2b/code-interpreter';
-import * as fs from 'fs';
-import * as path from 'path';
+import { ChatGroq } from "@langchain/groq";
+import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
+import { ChatMistralAI } from "@langchain/mistralai";
+import { ChatOpenAI } from "@langchain/openai";   // ← Cerebras via wrapper OpenAI-compatible
+import { ChatCohere } from "@langchain/cohere";
+// ChatCerebras (@langchain/cerebras) SUPPRIMÉ : incompatible avec @langchain/core@0.3.x
+// Cerebras est utilisé via ChatOpenAI avec baseURL custom (zéro conflit de dépendance)
+import { StateGraph, Annotation, END, START } from "@langchain/langgraph";
+import { ToolNode } from "@langchain/langgraph/prebuilt";
+import { HumanMessage, AIMessage, BaseMessage, ToolMessage } from "@langchain/core/messages";
+import { InMemoryChatMessageHistory } from "@langchain/core/chat_history";
+import { InMemoryCache } from "@langchain/core/caches";
+import { outilsDeBase } from "./tools";
+import { browserTools } from "./browser/browser-tools";
+import { e2bTools } from "./browser/e2b-tools";
+import { credentialTools } from "./browser/credentials";
+import { debugTools } from "./browser/debug-tools";
+import { fsMemoryTools, offloadSiVolumineux, INSTRUCTIONS_FILE, TODO_FILE } from "./memory/fs-memory";
+import { navigateur } from "./browser/browser-manager";
+import { e2bSandbox } from "./browser/e2b-sandbox";
+import { AdvancedContextManager, ContextConfig } from "./context/context-manager";
+import * as fs from "fs";
+import * as readline from "readline";
+import * as dotenv from "dotenv";
+import console from "console";
 
-export class E2BSandbox {
-  private sandbox: Sandbox | null = null;
-  private browserReady = false;  // true = browser + page initialisés dans le kernel Python
-  private readonly screenshotsDir = path.resolve("./screenshots");
-  private readonly SANDBOX_TIMEOUT = 5 * 60 * 1000; // 5 minutes (défaut E2B)
-  private lastActivity = 0;
+dotenv.config();
 
-  constructor() {
-    if (!fs.existsSync(this.screenshotsDir)) {
-      fs.mkdirSync(this.screenshotsDir, { recursive: true });
+// UTILITAIRES
+
+const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+
+// CLASSIFICATION DES ERREURS API
+
+type ErrorKind =
+    | "QUOTA_EXHAUSTED"  // quota journalier épuisé → skip définitif dans la session
+    | "SKIP"     // erreur de format pour CETTE requête → skip mais provider réutilisable
+    | "RATE_LIMIT"       // trop de requêtes → attendre et réessayer
+    | "RETRYABLE"        // erreur temporaire → réessayer
+    | "FATAL";           // erreur irrécupérable → stopper
+
+function classifierErreur(error: any): ErrorKind {
+    const msg    = (error?.message ?? "").toLowerCase();
+    const status = error?.status ?? 0;
+
+    if (
+        msg.includes("limit: 0") ||
+        msg.includes("per_day") ||
+        (msg.includes("quota") && msg.includes("exceeded") && msg.includes("day"))
+    ) return "QUOTA_EXHAUSTED";
+
+    // 413 = contexte trop grand pour CE modèle → skip immédiat, 0 retry
+    // DOIT être avant RATE_LIMIT (sinon le 429 capte tout)
+    if (status === 413 || msg.includes("request too large") || msg.includes("too large for model")) {
+        return "QUOTA_EXHAUSTED";
     }
-  }
 
-  // ─── Auto-recovery ────────────────────────────────────────────────────────
-  // Vérifie si le sandbox et le navigateur sont encore vivants.
-  // Si le sandbox a expiré (502) ou si `page` n'est pas défini → réinitialise.
-  // Appelé avant chaque opération pour garantir un état valide.
-  // ─────────────────────────────────────────────────────────────────────────
+    if (
+        status === 429 ||
+        msg.includes("rate_limit") ||
+        msg.includes("rate limit") ||
+        msg.includes("too many requests") ||
+        msg.includes("resource_exhausted") ||
+        (msg.includes("quota") && msg.includes("exceeded") && !msg.includes("day"))
+    ) return "RATE_LIMIT";
 
-  private async assureSandboxVivant(): Promise<string | null> {
-    // Vérifier si le sandbox est proche du timeout (4min30) ou déjà mort
-    const now = Date.now();
-    const sandboxExpired = this.lastActivity > 0 &&
-      (now - this.lastActivity) > (this.SANDBOX_TIMEOUT - 30_000);
+    if (
+        status === 503 ||
+        msg.includes("overloaded") ||
+        msg.includes("timeout") ||
+        msg.includes("unavailable")
+    ) return "RETRYABLE";
 
-    if (!this.sandbox || !this.browserReady || sandboxExpired) {
-      console.log("🔄 Sandbox E2B : réinitialisation automatique...");
-      const result = await this.initialiser();
-      if (result.startsWith("❌")) return result;
-    } else {
-      // Ping rapide pour vérifier que le kernel Python répond encore
-      try {
-        const ping = await this.sandbox!.runCode("print('ok')");
-        if (ping.error || !ping.logs?.stdout?.join('').includes('ok')) {
-          console.log("🔄 Sandbox E2B : kernel mort, réinitialisation...");
-          const result = await this.initialiser();
-          if (result.startsWith("❌")) return result;
+    // 404 = modèle introuvable → passer au suivant
+    if (status === 404 || msg.includes("model_not_found") || msg.includes("no body")) {
+        return "QUOTA_EXHAUSTED";
+    }
+
+    // 413 → géré en premier dans le classifier
+    // Cohere : "Missing required key type" = incompatibilité de schema → passer au suivant
+    if (msg.includes("missing required key") || msg.includes("parameterdefinitions")) {
+        return "QUOTA_EXHAUSTED";
+    }
+
+    // Mistral / OpenAI : erreurs de FORMAT de message → SKIP (provider réutilisable)
+    if (
+        msg.includes("tool call id has to be defined") ||
+        msg.includes("expected last role") ||
+        msg.includes("message_order") ||
+        msg.includes("invalid_request_message") ||
+        msg.includes("all openai tool calls must have an") ||
+        msg.includes("\"id\" field") ||
+        // Mistral rejette un AIMessage avec content="" ET sans tool_calls
+        // Se produit quand un provider renvoie une réponse vide et qu'on la passe en contexte
+        msg.includes("assistant message must have either content or tool_calls")
+    ) {
+        return "SKIP";
+    }
+
+    // Gemini thinking : thought_signature manquant → skip cette requête
+    if (msg.includes("thought_signature") || msg.includes("missing a thought")) {
+        return "SKIP";
+    }
+
+    return "FATAL";
+}
+
+// RATE LIMITER
+
+class RateLimiter {
+    private lastCallTime = 0;
+    private readonly minDelay: number;
+
+    constructor(requestsPerMinute: number) {
+        this.minDelay = (60 / requestsPerMinute) * 1000;
+    }
+
+    async wait(): Promise<void> {
+        const now     = Date.now();
+        const elapsed = now - this.lastCallTime;
+        if (elapsed < this.minDelay) {
+            const waitMs = this.minDelay - elapsed;
+            console.log(`🕒 Rate limiter : pause ${Math.round(waitMs)}ms...`);
+            await sleep(waitMs);
         }
-      } catch (e: any) {
-        // 502 = sandbox timeout sur le remote
-        if (e?.message?.includes("502") || e?.message?.includes("not found") ||
-            e?.message?.includes("timeout") || e?.message?.includes("ECONNREFUSED")) {
-          console.log("🔄 Sandbox E2B : 502 détecté, réinitialisation...");
-          this.sandbox = null;
-          this.browserReady = false;
-          const result = await this.initialiser();
-          if (result.startsWith("❌")) return result;
+        this.lastCallTime = Date.now();
+    }
+}
+
+// GESTIONNAIRE MULTI-PROVIDER AVEC FALLBACK AUTOMATIQUE
+
+interface ProviderConfig {
+    name: string;
+    rpm: number;
+    maxRetries: number;
+    factory: (tools: any[]) => any;
+}
+
+/**
+ * Chaîne de fallback — ordre optimisé par quota/jour puis qualité.
+ *
+ * STRATÉGIE : illimités en tête, quotas limités en dernier recours.
+ *
+ * ┌──────────────────────────────┬──────┬──────────────┬─────────────────────┐
+ * │ Provider / Modèle            │ RPM  │ Req/jour     │ Notes               │
+ * ├──────────────────────────────┼──────┼──────────────┼─────────────────────┤
+ * │ Cerebras llama-3.3-70b       │  28  │  ILLIMITÉ    │ Principal           │
+ * │ Mistral small                │   4  │  ILLIMITÉ    │ 1 Md tokens/mois    │
+ * │ Groq llama-3.3-70b           │  25  │   14 400     │ Très capable        │
+ * │ Groq llama-3.1-8b            │  25  │   14 400 *   │ Quota séparé        │
+ * │ Gemini 2.0 Flash             │  55  │    1 500     │ Précieux, last res. │
+ * │ Gemini 2.5 Flash             │   9  │      500 *   │ Quota séparé        │
+ * │ Cohere command-r             │  20  │    1 000     │ Skip auto (schema)  │
+ * └──────────────────────────────┴──────┴──────────────┴─────────────────────┘
+ */
+const PROVIDERS_CHAIN: ProviderConfig[] = [
+
+    // ── 1. Cerebras llama-3.3-70b — ILLIMITÉ, très capable, 28 RPM
+    //       Via wrapper OpenAI-compatible (zéro conflit de dépendance)
+    {
+        name: "Cerebras llama-3.3-70b",
+        rpm: 28,
+        maxRetries: 3,
+        factory: (tools) => new ChatOpenAI({
+            model: "llama3.3-70b",
+            temperature: 0,
+            apiKey: process.env.CEREBRAS_API_KEY,
+            configuration: { baseURL: "https://api.cerebras.ai/v1" },
+            maxRetries: 0,
+        }).bindTools(tools, { strict: false }),
+    },
+
+    // ── 2. Mistral small — ILLIMITÉ (1 Md tokens/mois), 4 RPM
+    //       Illimité mais lent → backup direct de Cerebras
+    {
+        name: "Mistral small",
+        rpm: 4,
+        maxRetries: 3,
+        factory: (tools) => new ChatMistralAI({
+            model: "mistral-small-latest",
+            temperature: 0,
+            apiKey: process.env.MISTRAL_API_KEY,
+            maxRetries: 0,
+        }).bindTools(tools),
+    },
+
+    // ── 3. Groq llama-3.3-70b — 14 400 req/jour, très capable, 25 RPM
+    {
+        name: "Groq llama-3.3-70b",
+        rpm: 25,
+        maxRetries: 3,
+        factory: (tools) => new ChatGroq({
+            model: "llama-3.3-70b-versatile",
+            temperature: 0,
+            apiKey: process.env.GROQ_API_KEY,
+            maxRetries: 0,
+        }).bindTools(tools),
+    },
+
+    // ── 4. Groq llama-3.1-8b — quota SÉPARÉ du 3.3-70b
+    {
+        name: "Groq llama-3.1-8b",
+        rpm: 25,
+        maxRetries: 3,
+        factory: (tools) => new ChatGroq({
+            model: "llama-3.1-8b-instant",
+            temperature: 0,
+            apiKey: process.env.GROQ_API_KEY,
+            maxRetries: 0,
+        }).bindTools(tools),
+    },
+
+    // ── 5. Gemini 2.0 Flash — 1 500 req/jour, meilleur pour l'agentic
+    //       Quota PRÉCIEUX → réservé en dernier recours
+    {
+        name: "Gemini 2.0 Flash",
+        rpm: 55,
+        maxRetries: 3,
+        factory: (tools) => new ChatGoogleGenerativeAI({
+            model: "gemini-2.0-flash",
+            temperature: 0,
+            apiKey: process.env.GOOGLE_API_KEY,
+            maxRetries: 0,
+        }).bindTools(tools),
+    },
+
+    // ── 6. Gemini 2.5 Flash — 500 req/jour, quota SÉPARÉ du 2.0
+    {
+        name: "Gemini 2.5 Flash",
+        rpm: 9,
+        maxRetries: 3,
+        factory: (tools) => new ChatGoogleGenerativeAI({
+            model: "gemini-2.5-flash",
+            temperature: 0,
+            apiKey: process.env.GOOGLE_API_KEY,
+            maxRetries: 0,
+        }).bindTools(tools),
+    },
+
+    // ── 7. Cohere command-r — sera skipé auto (incompatibilité schema tools)
+    //       Gardé comme dernier filet
+    {
+        name: "Cohere command-r",
+        rpm: 20,
+        maxRetries: 3,
+        factory: (tools) => new ChatCohere({
+            model: "command-r",
+            temperature: 0,
+            apiKey: process.env.COHERE_API_KEY,
+            maxRetries: 0,
+        }).bindTools(tools, { strict: false }),
+    },
+
+    // gemini-3-flash-preview DÉSACTIVÉ : exige thought_signatures incompatibles
+];
+
+class MultiProviderLLM {
+    // ── État par provider ─────────────────────────────────────────────────────
+    // quotaEpuise[i] = true  → quota journalier épuisé, skip définitivement
+    // rateLimitedUntil[i]    → timestamp jusqu'auquel ce provider est en cooldown
+    //
+    // IMPORTANT : ces états persistent entre les requêtes (même instance).
+    // currentIndex est recalculé dynamiquement à chaque invoke() pour trouver
+    // le premier provider disponible — il ne se bloque plus jamais en fin de liste.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private quotaEpuise      = new Map<number, boolean>();
+    private rateLimitedUntil = new Map<number, number>();
+    private rateLimiters     = new Map<number, RateLimiter>();
+    private instances        = new Map<number, any>();
+    private tools: any[];
+
+    constructor(tools: any[]) {
+        this.tools = tools;
+        PROVIDERS_CHAIN.forEach((p, i) => {
+            this.rateLimiters.set(i, new RateLimiter(p.rpm));
+            this.quotaEpuise.set(i, false);
+            this.rateLimitedUntil.set(i, 0);
+        });
+    }
+
+    private getInstance(index: number): any {
+        if (!this.instances.has(index)) {
+            console.log(`Initialisation provider : ${PROVIDERS_CHAIN[index].name}`);
+            this.instances.set(index, PROVIDERS_CHAIN[index].factory(this.tools));
+        }
+        return this.instances.get(index)!;
+    }
+
+    // Retourne le premier provider disponible (non épuisé, non en cooldown)
+    private premierDisponible(): number {
+        const now = Date.now();
+        for (let i = 0; i < PROVIDERS_CHAIN.length; i++) {
+            if (this.quotaEpuise.get(i)) continue;
+            if ((this.rateLimitedUntil.get(i) ?? 0) > now) continue;
+            return i;
+        }
+        return -1; // tous épuisés
+    }
+
+    getCurrentProviderName(): string {
+        const i = this.premierDisponible();
+        return i >= 0 ? PROVIDERS_CHAIN[i].name : "Aucun";
+    }
+
+    // Réinitialise les rate limits (pas les quotas épuisés) pour un nouveau jour
+    resetRateLimits(): void {
+        this.rateLimitedUntil.forEach((_, i) => this.rateLimitedUntil.set(i, 0));
+        console.log("Rate limits réinitialisés.");
+    }
+
+    async invoke(messages: BaseMessage[]): Promise<any> {
+        // Chercher le premier provider disponible — à chaque appel, pas en continu
+        let startIndex = this.premierDisponible();
+
+        if (startIndex < 0) {
+            throw new Error(
+                "Tous les providers LLM ont atteint leur quota journalier. " +
+                "Reessaie demain ou active la facturation sur une cle API."
+            );
+        }
+
+        // Essayer chaque provider disponible dans l'ordre
+        for (let i = startIndex; i < PROVIDERS_CHAIN.length; i++) {
+            if (this.quotaEpuise.get(i)) continue;
+
+            const now = Date.now();
+            const cooldownUntil = this.rateLimitedUntil.get(i) ?? 0;
+            if (cooldownUntil > now) {
+                const wait = cooldownUntil - now;
+                console.log(`⏳ [${PROVIDERS_CHAIN[i].name}] en cooldown, attente ${Math.round(wait/1000)}s...`);
+                await sleep(wait);
+            }
+
+            const config  = PROVIDERS_CHAIN[i];
+            const limiter = this.rateLimiters.get(i)!;
+            const llm     = this.getInstance(i);
+
+            for (let attempt = 0; attempt < config.maxRetries; attempt++) {
+                try {
+                    await limiter.wait();
+                    console.log(`[${config.name}] tentative ${attempt + 1}/${config.maxRetries}`);
+                    const result = await llm.invoke(messages);
+                    // Succès → retirer le cooldown éventuel
+                    this.rateLimitedUntil.set(i, 0);
+                    return result;
+                } catch (error: any) {
+                    const kind = classifierErreur(error);
+                    console.warn(`[${config.name}] ${kind} : ${String(error?.message).slice(0, 120)}`);
+
+                    switch (kind) {
+                        case "QUOTA_EXHAUSTED":
+                            // Quota journalier épuisé → marquer définitivement et passer au suivant
+                            console.warn(`Quota epuise sur [${config.name}] → skip définitif pour cette session`);
+                            this.quotaEpuise.set(i, true);
+                            attempt = config.maxRetries;
+                            break;
+
+                        case "SKIP":
+                            // Erreur de format pour CETTE requête (ex: tool_call sans id, message_order)
+                            // → skip ce provider pour cette requête UNIQUEMENT, pas définitivement
+                            console.warn(`[${config.name}] format incompatible pour cette requête → skip (provider conservé)`);
+                            attempt = config.maxRetries;
+                            break;
+
+                        case "RATE_LIMIT": {
+                            const match   = error?.message?.match(/retry.*?(\d+(?:\.\d+)?)\s*s/i);
+                            const suggest = match ? parseFloat(match[1]) * 1000 : 0;
+                            const waitMs  = Math.max(suggest, Math.pow(2, attempt + 1) * 1000);
+                            console.warn(`Rate limit - attente ${Math.round(waitMs / 1000)}s...`);
+                            // Mémoriser le cooldown pour ne pas réessayer avant ce délai
+                            this.rateLimitedUntil.set(i, Date.now() + waitMs);
+                            await sleep(waitMs);
+                            break;
+                        }
+
+                        case "RETRYABLE": {
+                            const waitMs = Math.pow(2, attempt + 1) * 1000;
+                            console.warn(`Erreur temporaire - attente ${Math.round(waitMs / 1000)}s...`);
+                            await sleep(waitMs);
+                            break;
+                        }
+
+                        case "FATAL":
+                            throw error;
+                    }
+                }
+            }
+
+            // Si on sort de la boucle de retries sans succès et sans exception fatale :
+            // c'est soit quota épuisé, soit rate limit dépassé → passer au suivant
+            if (!this.quotaEpuise.get(i)) {
+                console.log(`[${config.name}] retries épuisés → provider suivant`);
+            }
+            const nextAvail = this.premierDisponible();
+            if (nextAvail > i) {
+                console.log(`Nouveau provider : ${PROVIDERS_CHAIN[nextAvail].name}`);
+            }
+        }
+
+        let nbEpuises = 0;
+        this.quotaEpuise.forEach(v => { if (v) nbEpuises++; });
+        if (nbEpuises >= PROVIDERS_CHAIN.length) {
+            throw new Error(
+                "Tous les providers LLM ont atteint leur quota journalier. " +
+                "Reessaie demain ou active la facturation sur une cle API."
+            );
+        }
+        // Certains ont SKIPpé → contexte cassé mais providers disponibles
+        throw new Error("CONTEXT_INCOMPATIBLE");
+    }
+}
+
+// MIDDLEWARE D'OFFLOAD : INTERCEPTE LES RESULTATS D'OUTILS VOLUMINEUX
+
+async function toolNodeAvecOffload(
+    etat: typeof EtatAgent.State,
+    toolNode: ToolNode
+): Promise<{ messages: BaseMessage[] }> {
+    const resultat = await toolNode.invoke(etat);
+
+    const messagesOptimises = resultat.messages.map((msg: BaseMessage) => {
+        if (!(msg instanceof ToolMessage)) return msg;
+        if (typeof msg.content !== "string") return msg;
+
+        const outilsExclus = ["screenshot_e2b", "obtenir_date", "calculer",
+                              "grep_memoire", "lire_lignes", "resume_session",
+                              "mettre_a_jour_todo", "lire_todo", "lire_instructions"];
+        if (outilsExclus.some(nom => msg.name?.includes(nom))) return msg;
+
+        const contenuOptimise = offloadSiVolumineux(msg.name ?? "tool", msg.content);
+
+        if (contenuOptimise !== msg.content) {
+            const ratio = Math.round(
+                ((msg.content.length - contenuOptimise.length) / msg.content.length) * 100
+            );
+            console.log(`Offload FS : ${msg.name} | ${msg.content.length} -> ${contenuOptimise.length} chars (-${ratio}% tokens)`);
+        }
+
+        return new ToolMessage({
+            content     : contenuOptimise,
+            tool_call_id: msg.tool_call_id,
+            name        : msg.name,
+        });
+    });
+
+    return { messages: messagesOptimises };
+}
+
+// INITIALISATION GLOBALE
+
+const TOUS_LES_TOOLS = [
+    ...outilsDeBase,
+    /* ...browserTools, */
+    ...e2bTools,
+    ...credentialTools,
+    ...debugTools,
+    ...fsMemoryTools,
+];
+
+const multiLLM = new MultiProviderLLM(TOUS_LES_TOOLS);
+
+const llmPourContexte = new ChatGoogleGenerativeAI({
+    model: "gemini-2.0-flash",
+    temperature: 0,
+    apiKey: process.env.GOOGLE_API_KEY,
+    maxRetries: 2,
+}) as any;
+
+const contextConfig: ContextConfig = {
+    maxTokens: 28000,
+    compressionThreshold: 0.75,
+    summaryInterval: 8,
+    keepLastNMessages: 6,
+};
+export const contextManager = new AdvancedContextManager(contextConfig, llmPourContexte);
+
+const memoireConversation = new InMemoryChatMessageHistory();
+
+// MEMOIRE EVOLUTIVE
+
+function chargerInstructionsMemoire(): string {
+    try {
+        if (!fs.existsSync(INSTRUCTIONS_FILE)) return "";
+        const contenu = fs.readFileSync(INSTRUCTIONS_FILE, "utf-8").trim();
+        if (contenu.length < 80) return "";
+        console.log(`Instructions memorisees chargees (${contenu.length} chars)`);
+        return "\n\n[INSTRUCTIONS MEMORISEES DES SESSIONS PRECEDENTES]\n" + contenu;
+    } catch {
+        return "";
+    }
+}
+
+// SYSTEM PROMPT
+// Règle KV cache : préfixe STABLE identique à chaque appel → pleinement caché.
+// Contenu dynamique (instructions apprises) injecté À LA FIN uniquement.
+
+const SYSTEME_PROMPT_BASE = `Tu es un expert IA autonome. Tu disposes des outils suivants pour interagir avec le monde exterieur. Reponds toujours en francais.
+
+OUTILS DISPONIBLES :
+
+Navigation (E2B Sandbox) :
+  - demarrer_sandbox, aller_vers_e2b, cliquer_e2b, taper_e2b
+  - lire_page_e2b, screenshot_e2b, attendre_e2b, cocher_case_e2b, scroller_e2b
+
+Fichiers de base :
+  - calculer, lire_fichier, ecrire_fichier, lister_fichiers, obtenir_date
+
+Credentials :
+  - sauvegarder_credential, lire_credential, generate_mot_de_passe
+
+Debug :
+  - diagnostic_navigateur, tester_selecteur
+
+FS-Memory (PRIORITAIRE pour les grands resultats) :
+  - grep_memoire       : chercher un mot dans un fichier sauvegarde
+  - lire_lignes        : lire des lignes precises d'un fichier
+  - rechercher_glob    : lister les fichiers par pattern
+  - ecrire_decouverte  : sauvegarder une info importante trouvee
+  - ecrire_plan        : sauvegarder un plan avant une tache complexe
+  - mettre_a_jour_todo : mettre a jour la todo-list de la tache en cours
+  - lire_todo          : lire la todo-list courante
+  - apprendre_instruction : memoriser une instruction de l'utilisateur
+  - lire_instructions  : charger les instructions des sessions precedentes
+  - resume_session     : voir tous les fichiers crees dans la session
+
+REGLE FONDAMENTALE - GESTION DU CONTEXTE :
+Quand un outil retourne un resultat volumineux (page HTML, longue liste), il est
+AUTOMATIQUEMENT sauvegarde dans ./agent-memory/tool-results/ et tu recois un message
+court avec le chemin. Utilise grep_memoire ou lire_lignes pour extraire
+UNIQUEMENT les informations dont tu as besoin.
+
+REGLES D'OR :
+1. TOUTE tache complexe commence par mettre_a_jour_todo (plan initial).
+2. Apres CHAQUE etape terminee, appelle mettre_a_jour_todo pour cocher l'etape.
+   Cela recite tes objectifs en fin de contexte et evite la derive.
+3. Quand tu trouves une info importante (selecteur CSS, URL), utilise ecrire_decouverte.
+4. Apres une creation de compte, sauvegarde les identifiants avec sauvegarder_credential.
+5. Si tu rencontres une erreur, NOTE-LA dans le todo (champ note de l'etape).
+   Ne cache jamais une erreur — elle met a jour tes croyances et evite la repetition.
+6. Si l'utilisateur te donne un conseil, utilise apprendre_instruction.
+7. Prends un screenshot avant/apres chaque action cle.
+8. Utilise attendre_e2b pour laisser le temps aux elements d'apparaitre.
+
+SELECTEURS COURANTS :
+- Google : 'input[name="q"]', 'textarea[name="q"]'
+- Formulaires : privilegier les selecteurs par texte (ex: button:has-text('Se connecter'))`;
+
+function construireSystemePrompt(): string {
+    return SYSTEME_PROMPT_BASE + chargerInstructionsMemoire();
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SANITISATION DES MESSAGES POUR PROVIDERS STRICTS (Mistral)
+//
+// Mistral exige :
+//   1. Chaque ToolMessage a un tool_call_id valide avec AIMessage parent
+//   2. Dernier message = Human ou Tool (jamais AI)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function sanitiserMessages(messages: BaseMessage[]): BaseMessage[] {
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // PASSE 0A : supprimer les AIMessages vides (ni content ni tool_calls)
+    // Mistral rejette code 400 "Assistant message must have either content
+    // or tool_calls" quand un AIMessage vide traîne dans le contexte.
+    // Cela arrive quand un provider (ex: Groq) retourne une réponse vide
+    // et qu'on l'ajoute au contexte pour le nudge.
+    //
+    // PASSE 0B : normaliser additional_kwargs.tool_calls en format OpenAI
+    // Gemini génère tool_calls avec ids valides MAIS additional_kwargs dans
+    // son propre format (sans id). Groq/Mistral lisent additional_kwargs →
+    // on les reconstruit en format OpenAI standard depuis msg.tool_calls.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    const pass0: BaseMessage[] = [];
+    let i = 0;
+    while (i < messages.length) {
+        const msg = messages[i];
+
+        if (msg instanceof AIMessage) {
+            const toolCalls   = msg.tool_calls ?? [];
+            const toolCallsAK = (msg.additional_kwargs?.tool_calls as any[]) ?? [];
+            const content     = String(msg.content ?? "").trim();
+            const hasTools    = toolCalls.length > 0 || toolCallsAK.length > 0;
+
+            // ── Passe 0A : AIMessage vide → supprimer ──
+            if (!content && !hasTools) {
+                console.warn(`⚠️  Sanitise P0A : AIMessage vide supprimé`);
+                i++;
+                continue;
+            }
+
+            if (hasTools) {
+                // ── RÈGLE FONDAMENTALE ──────────────────────────────────────────────
+                // msg.tool_calls   = représentation LangChain canonique (avec ids)
+                // additional_kwargs.tool_calls = format brut du provider (Gemini : sans id)
+                //
+                // On NE vérifie les ids QUE dans msg.tool_calls (la source de vérité).
+                // additional_kwargs sera toujours RECONSTRUIT en format OpenAI standard.
+                // Ne jamais supprimer un AIMessage à cause du format de additional_kwargs.
+                // ───────────────────────────────────────────────────────────────────
+
+                // Cas 1 : msg.tool_calls présents avec ids → reconstruire AK et garder
+                if (toolCalls.length > 0 && toolCalls.every(tc => !!tc.id)) {
+                    const akNormalisé = toolCalls.map(tc => ({
+                        id      : tc.id!,
+                        type    : "function" as const,
+                        function: {
+                            name     : tc.name,
+                            arguments: typeof tc.args === "string"
+                                ? tc.args
+                                : JSON.stringify(tc.args ?? {}),
+                        },
+                    }));
+                    pass0.push(new AIMessage({
+                        content          : msg.content,
+                        tool_calls       : toolCalls,
+                        additional_kwargs: { ...msg.additional_kwargs, tool_calls: akNormalisé },
+                    }));
+                    i++;
+                    continue;
+                }
+
+                // Cas 2 : msg.tool_calls présents MAIS certains sans id → irrécupérable
+                if (toolCalls.length > 0 && toolCalls.some(tc => !tc.id)) {
+                    let j = i + 1, skipped = 0;
+                    while (j < messages.length && messages[j] instanceof ToolMessage) { j++; skipped++; }
+                    console.warn(`⚠️  Sanitise P0B : tool_calls sans id → AIMessage supprimé${skipped > 0 ? ` + ${skipped} ToolMessage(s)` : ""}`);
+                    i = j;
+                    continue;
+                }
+
+                // Cas 3 : msg.tool_calls vide mais additional_kwargs non vide
+                // (format provider sans mapping LangChain) → tenter de récupérer les ids depuis AK
+                if (toolCalls.length === 0 && toolCallsAK.length > 0) {
+                    const akHasIds = toolCallsAK.every((tc: any) => !!tc.id);
+                    if (akHasIds) {
+                        // Reconstruire tool_calls LangChain depuis additional_kwargs
+                        const rebuiltToolCalls = toolCallsAK.map((tc: any) => ({
+                            id  : tc.id,
+                            name: tc.function?.name ?? tc.name ?? "unknown",
+                            args: (() => {
+                                try { return JSON.parse(tc.function?.arguments ?? tc.arguments ?? "{}"); }
+                                catch { return {}; }
+                            })(),
+                            type: "tool_call" as const,
+                        }));
+                        pass0.push(new AIMessage({
+                            content          : msg.content,
+                            tool_calls       : rebuiltToolCalls,
+                            additional_kwargs: { ...msg.additional_kwargs, tool_calls: toolCallsAK },
+                        }));
+                        console.warn(`⚠️  Sanitise P0C : tool_calls reconstruits depuis additional_kwargs`);
+                        i++;
+                        continue;
+                    } else {
+                        // AK sans ids → supprimer
+                        let j = i + 1, skipped = 0;
+                        while (j < messages.length && messages[j] instanceof ToolMessage) { j++; skipped++; }
+                        console.warn(`⚠️  Sanitise P0C : additional_kwargs sans id → AIMessage supprimé${skipped > 0 ? ` + ${skipped} ToolMessage(s)` : ""}`);
+                        i = j;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        pass0.push(msg);
+        i++;
+    }
+
+    // ── Passe 1 : ToolMessages orphelins ──
+    const pass1: BaseMessage[] = [];
+    for (const msg of pass0) {
+        if (msg instanceof ToolMessage) {
+            const prev = pass1.at(-1);
+            const hasParent = prev instanceof AIMessage && (
+                (prev.tool_calls?.length ?? 0) > 0 ||
+                ((prev.additional_kwargs?.tool_calls as any[])?.length ?? 0) > 0
+            );
+            if (!hasParent || !msg.tool_call_id) {
+                console.warn(`⚠️  Sanitise P1 : ToolMessage orphelin ignoré (id: ${msg.tool_call_id ?? "undefined"})`);
+                continue;
+            }
+        }
+        pass1.push(msg);
+    }
+
+    // ── Passe 2 : AIMessages avec tool_calls sans ToolMessage suivant ──
+    const pass2: BaseMessage[] = [];
+    for (let i = 0; i < pass1.length; i++) {
+        const msg  = pass1[i];
+        const next = pass1[i + 1];
+        const isAIWithTools = msg instanceof AIMessage && (
+            (msg.tool_calls?.length ?? 0) > 0 ||
+            ((msg.additional_kwargs?.tool_calls as any[])?.length ?? 0) > 0
+        );
+        if (isAIWithTools && !(next instanceof ToolMessage)) {
+            console.warn(`⚠️  Sanitise : AIMessage avec tool_calls sans ToolMessage suivant ignoré`);
+            continue;
+        }
+        pass2.push(msg);
+    }
+
+    // ── Passe 3 : retirer les AIMessages terminaux avec tool_calls ──
+    const result = [...pass2];
+    while (result.length > 0) {
+        const last = result.at(-1)!;
+        const isTrailingToolAI = last instanceof AIMessage && (
+            (last.tool_calls?.length ?? 0) > 0 ||
+            ((last.additional_kwargs?.tool_calls as any[])?.length ?? 0) > 0
+        );
+        if (isTrailingToolAI) {
+            console.warn(`⚠️  Sanitise : AIMessage terminal avec tool_calls supprimé`);
+            result.pop();
         } else {
-          return `❌ Erreur sandbox : ${e?.message}`;
+            break;
         }
-      }
     }
-    this.lastActivity = Date.now();
-    return null; // OK
-  }
 
-  /**
-   * Initialise la sandbox E2B et lance un navigateur Playwright.
-   */
-  async initialiser(options?: { headless?: boolean }): Promise<string> {
-    try {
-      // Fermer le sandbox existant proprement
-      if (this.sandbox) {
-        try { await this.sandbox.kill(); } catch {}
-        this.sandbox = null;
-        this.browserReady = false;
-      }
-
-      this.sandbox = await Sandbox.create({ timeoutMs: 5 * 60 * 1000 });
-
-      const headless = options?.headless ?? true;
-
-      const installCode = `
-import subprocess
-import sys
-
-try:
-    import playwright
-except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "playwright"])
-    subprocess.check_call(["playwright", "install", "--with-deps", "chromium"])
-print("Playwright installed or already present")
-`;
-      const installResult = await this.sandbox.runCode(installCode);
-      if (installResult.error) {
-        return `❌ Erreur installation Playwright : ${installResult.error.name}: ${installResult.error.value}`;
-      }
-
-      const setupCode = `
-import asyncio
-from playwright.async_api import async_playwright
-
-async def setup_browser():
-    global playwright, browser, page
-    playwright = await async_playwright().start()
-    browser = await playwright.chromium.launch(headless=${headless ? 'True' : 'False'})
-    page = await browser.new_page()
-    print("Browser ready")
-
-await setup_browser()
-`;
-      const setupResult = await this.sandbox.runCode(setupCode);
-      if (setupResult.error) {
-        return `❌ Erreur setup navigateur : ${setupResult.error.name}: ${setupResult.error.value}\n${setupResult.error.traceback}`;
-      }
-
-      this.browserReady = true;
-      this.lastActivity = Date.now();
-      return "✅ Sandbox E2B et Navigateur Chromium prêts (Distant)";
-    } catch (e) {
-      return `❌ Erreur initialisation E2B : ${(e as Error).message}`;
+    // ── Passe 4 : Mistral refuse si le DERNIER message est un AIMessage (même sans tool_calls)
+    // Après suppression des orphelins, le contexte peut se terminer sur un AIMessage.
+    // On ajoute un HumanMessage invisible pour satisfaire la contrainte de rôle.
+    const last = result.at(-1);
+    if (last instanceof AIMessage) {
+        const lastText = String(last.content ?? "").trim();
+        if (!lastText) {
+            // AIMessage vide en fin → le retirer directement
+            result.pop();
+            console.warn(`⚠️  Sanitise : AIMessage vide terminal supprimé`);
+        } else {
+            // AIMessage avec contenu → ajouter un Human "relance"
+            result.push(new HumanMessage(
+                "[RELANCE SYSTÈME] Reprends la tâche là où tu t'es arrêté."
+            ));
+            console.warn(`⚠️  Sanitise : HumanMessage de relance ajouté (contexte terminait sur AIMessage)`);
+        }
     }
-  }
 
-  async allerVers(url: string): Promise<string> {
-    const err = await this.assureSandboxVivant();
-    if (err) return err;
+    return result;
+}
 
-    try {
-      const code = `
-import asyncio
+// GRAPHE LANGGRAPH
 
-async def go():
-    await page.goto("${url}", wait_until="networkidle")
-    print(f"Navigated to {page.url}")
+const EtatAgent = Annotation.Root({
+    messages: Annotation<BaseMessage[]>({
+        reducer: (ancien, nouveau) => [...ancien, ...nouveau],
+        default: () => [],
+    }),
+});
 
-await go()
-`;
-      const result = await this.sandbox!.runCode(code);
-      if (result.error) return `❌ Erreur navigation : ${result.error.name}: ${result.error.value}\n${result.error.traceback}`;
-      this.lastActivity = Date.now();
-      return `✅ Navigation : ${result.logs?.stdout?.join('\n') || result.text || ''}`;
-    } catch (e) { return `❌ Erreur navigation : ${(e as Error).message}`; }
-  }
+const toolNodeBase = new ToolNode(TOUS_LES_TOOLS);
 
-  async lirePage(options: { format?: "texte" | "html" | "url" | "titre"; selecteur?: string }): Promise<string> {
-    const err = await this.assureSandboxVivant();
-    if (err) return err;
-
-    try {
-      let evalCode = '';
-      if (options.format === "html") {
-        evalCode = 'await page.content()';
-      } else if (options.format === "url") {
-        evalCode = 'page.url';
-      } else if (options.format === "titre") {
-        evalCode = 'await page.title()';
-      } else {
-        evalCode = options.selecteur
-          ? `await page.inner_text("${options.selecteur}")`
-          : 'await page.evaluate("() => document.body.innerText")';
-      }
-
-      const code = `
-import asyncio
-
-async def read():
-    content = ${evalCode}
-    print(content)
-
-await read()
-`;
-      const result = await this.sandbox!.runCode(code);
-      if (result.error) return `❌ Erreur lecture : ${result.error.name}: ${result.error.value}\n${result.error.traceback}`;
-      this.lastActivity = Date.now();
-      return (result.logs?.stdout?.join('\n') || result.text || '').slice(0, 5000);
-    } catch (e) { return `❌ Erreur lecture : ${(e as Error).message}`; }
-  }
-
-  async cliquer(options: { selecteur?: string; texte?: string }): Promise<string> {
-    const err = await this.assureSandboxVivant();
-    if (err) return err;
-
-    try {
-      let action = '';
-      if (options.texte) {
-        action = `await page.get_by_text("${options.texte}").first.click()`;
-      } else if (options.selecteur) {
-        action = `await page.click("${options.selecteur}")`;
-      } else {
-        return "❌ Aucun sélecteur ou texte fourni";
-      }
-
-      const code = `
-import asyncio
-
-async def click():
-    ${action}
-    print("Clicked")
-
-await click()
-`;
-      const result = await this.sandbox!.runCode(code);
-      if (result.error) return `❌ Erreur clic : ${result.error.name}: ${result.error.value}\n${result.error.traceback}`;
-      this.lastActivity = Date.now();
-      return `✅ Clic effectué sur ${options.texte || options.selecteur}`;
-    } catch (e) { return `❌ Erreur clic : ${(e as Error).message}`; }
-  }
-
-  async taper(options: { selecteur: string; texte: string; effacer?: boolean }): Promise<string> {
-    const err = await this.assureSandboxVivant();
-    if (err) return err;
-
-    try {
-      const effacer = options.effacer ?? true;
-      const action = effacer
-        ? `await page.fill("${options.selecteur}", "${options.texte.replace(/"/g, '\\"')}")`
-        : `await page.type("${options.selecteur}", "${options.texte.replace(/"/g, '\\"')}")`;
-
-      const code = `
-import asyncio
-
-async def type_text():
-    ${action}
-    print("Text typed")
-
-await type_text()
-`;
-      const result = await this.sandbox!.runCode(code);
-      if (result.error) return `❌ Erreur saisie : ${result.error.name}: ${result.error.value}\n${result.error.traceback}`;
-      this.lastActivity = Date.now();
-      return `✅ Texte "${options.texte}" saisi dans ${options.selecteur}`;
-    } catch (e) { return `❌ Erreur saisie : ${(e as Error).message}`; }
-  }
-
-  async screenshot(nom?: string): Promise<string> {
-    const err = await this.assureSandboxVivant();
-    if (err) return err;
-
-    try {
-      const code = `
-import asyncio
-import base64
-
-async def take_screenshot():
-    screenshot_bytes = await page.screenshot()
-    print(base64.b64encode(screenshot_bytes).decode())
-
-await take_screenshot()
-`;
-      const result = await this.sandbox!.runCode(code);
-      if (result.error) return `❌ Erreur screenshot : ${result.error.name}: ${result.error.value}\n${result.error.traceback}`;
-
-      const base64Data = result.logs?.stdout?.join('') || result.text;
-      if (!base64Data) return "❌ Aucune donnée reçue pour le screenshot";
-      this.lastActivity = Date.now();
-      return `data:image/png;base64,${base64Data}`;
-    } catch (e) { return `❌ Erreur screenshot : ${(e as Error).message}`; }
-  }
-
-  async attendre(options: { ms?: number; selecteur?: string; texte?: string }): Promise<string> {
-    const err = await this.assureSandboxVivant();
-    if (err) return err;
-
-    try {
-      let action = '';
-      if (options.ms) {
-        action = `await page.wait_for_timeout(${options.ms})`;
-      } else if (options.selecteur) {
-        action = `await page.wait_for_selector("${options.selecteur}")`;
-      } else if (options.texte) {
-        action = `await page.wait_for_selector("text=${options.texte}")`;
-      } else {
-        return "❌ Aucune condition d'attente spécifiée";
-      }
-
-      const code = `
-import asyncio
-
-async def wait():
-    ${action}
-    print("Wait complete")
-
-await wait()
-`;
-      const result = await this.sandbox!.runCode(code);
-      if (result.error) return `❌ Erreur attente : ${result.error.name}: ${result.error.value}\n${result.error.traceback}`;
-      this.lastActivity = Date.now();
-      return `✅ Attente terminée`;
-    } catch (e) { return `❌ Erreur attente : ${(e as Error).message}`; }
-  }
-
-  async cocherCase(selecteur: string): Promise<string> {
-    const err = await this.assureSandboxVivant();
-    if (err) return err;
-
-    try {
-      const code = `
-import asyncio
-
-async def check_box():
-    await page.check("${selecteur}")
-    print("Checkbox checked")
-
-await check_box()
-`;
-      const result = await this.sandbox!.runCode(code);
-      if (result.error) return `❌ Erreur cocher case : ${result.error.name}: ${result.error.value}\n${result.error.traceback}`;
-      this.lastActivity = Date.now();
-      return `✅ Case cochée : ${selecteur}`;
-    } catch (e) { return `❌ Erreur cocher case : ${(e as Error).message}`; }
-  }
-
-  async scroller(direction: "haut" | "bas", pixels: number = 400): Promise<string> {
-    const err = await this.assureSandboxVivant();
-    if (err) return err;
-
-    try {
-      const delta = direction === "bas" ? pixels : -pixels;
-      const code = `
-import asyncio
-
-async def scroll():
-    await page.evaluate("window.scrollBy(0, ${delta})")
-    print("Scrolled")
-
-await scroll()
-`;
-      const result = await this.sandbox!.runCode(code);
-      if (result.error) return `❌ Erreur scroll : ${result.error.name}: ${result.error.value}\n${result.error.traceback}`;
-      this.lastActivity = Date.now();
-      return `✅ Scroll ${direction} de ${pixels} pixels effectué`;
-    } catch (e) { return `❌ Erreur scroll : ${(e as Error).message}`; }
-  }
-
-  async fermer(): Promise<void> {
-    if (this.sandbox) {
-      try {
-        await this.sandbox.runCode(`
-import asyncio
-async def close_browser():
-    try: await browser.close()
-    except: pass
-    try: await playwright.stop()
-    except: pass
-await close_browser()
-`);
-      } catch {}
-      try { await this.sandbox.kill(); } catch {}
-      this.sandbox = null;
-      this.browserReady = false;
+// ─────────────────────────────────────────────────────────────────────────────
+// NORMALISATION DES IDS — intercepte la réponse LLM AVANT qu'elle entre
+// dans etat.messages. Gemini génère des tool_calls sans id → les ToolMessages
+// créés par LangGraph héritent de tool_call_id=undefined → orphelins permanents.
+// Ce fix assigne un id AVANT que le mal soit fait.
+// ─────────────────────────────────────────────────────────────────────────────
+function normaliserToolCallIds(msg: any): any {
+    const toolCalls = msg.tool_calls ?? [];
+    if (toolCalls.length === 0) return msg;
+    if (toolCalls.every((tc: any) => !!tc.id)) {
+        // Ids OK — reconstruire quand même additional_kwargs en format OpenAI
+        // (Groq/Mistral lisent additional_kwargs, pas msg.tool_calls)
+        const akNormalisé = toolCalls.map((tc: any) => ({
+            id: tc.id, type: "function" as const,
+            function: { name: tc.name, arguments: typeof tc.args === "string" ? tc.args : JSON.stringify(tc.args ?? {}) },
+        }));
+        return new AIMessage({
+            content: msg.content, tool_calls: toolCalls,
+            additional_kwargs: { ...msg.additional_kwargs, tool_calls: akNormalisé },
+        });
     }
-  }
+    // Ids manquants → en assigner
+    const fixed = toolCalls.map((tc: any) => {
+        if (tc.id) return tc;
+        const id = Math.random().toString(36).slice(2, 11);
+        console.warn(`🔧 tool_call "${tc.name}" sans id → id="${id}" assigné`);
+        return { ...tc, id };
+    });
+    const akNormalisé = fixed.map((tc: any) => ({
+        id: tc.id, type: "function" as const,
+        function: { name: tc.name, arguments: typeof tc.args === "string" ? tc.args : JSON.stringify(tc.args ?? {}) },
+    }));
+    return new AIMessage({
+        content: msg.content, tool_calls: fixed,
+        additional_kwargs: { ...msg.additional_kwargs, tool_calls: akNormalisé },
+    });
+}
+
+async function noeudLLM(etat: typeof EtatAgent.State) {
+    console.log(`noeudLLM - ${etat.messages.length} msgs | Provider : ${multiLLM.getCurrentProviderName()}`);
+
+    const dernier = etat.messages.at(-1);
+    if (dernier instanceof ToolMessage) {
+        console.log("ToolMessage recu:", String(dernier.content).slice(0, 150));
+    }
+
+    try {
+        const SYSTEME_PROMPT = construireSystemePrompt();
+        const optimizedContext = await contextManager.getOptimizedContext(SYSTEME_PROMPT);
+        const allMessages      = [...optimizedContext, ...etat.messages];
+
+        const stats = contextManager.getContextStats();
+        console.log(
+            `Contexte : ${stats.totalMessages} msgs | ` +
+            `${stats.currentTokens} tokens | ` +
+            `compression : ${((1 - stats.compressionRatio) * 100).toFixed(0)}%`
+        );
+
+        // ── Fenêtre glissante ──────────────────────────────────────────────────
+        // etat.messages accumule TOUT depuis le début (reducer append-only).
+        // Le contextManager gère déjà l'historique global.
+        // On ne passe que les 12 derniers messages pour éviter l'accumulation
+        // de paires AIMessage/ToolMessage de providers différents → orphelins.
+        const MAX_RECENT = 12;
+        const recent = etat.messages.length > MAX_RECENT
+            ? etat.messages.slice(-MAX_RECENT)
+            : etat.messages;
+        // Ne jamais commencer sur un AIMessage sans tool_calls (contexte incohérent)
+        let debut = 0;
+        while (debut < recent.length - 1 &&
+               recent[debut] instanceof AIMessage &&
+               (recent[debut].tool_calls?.length ?? 0) === 0) { debut++; }
+        const allMessagesFenetre = [...optimizedContext, ...recent.slice(debut)];
+        // ────────────────────────────────────────────────────────────────────
+
+        const messagesSanitises = sanitiserMessages(allMessagesFenetre);
+        const reponse = await multiLLM.invoke(messagesSanitises);
+        console.log("Reponse LLM recue.");
+
+        // Détection réponse vide : pas de texte ET pas de tool calls
+        // Cause : Gemini 2.5 Flash peut retourner un message vide si le contexte
+        // contient des messages d'une session précédente qui le perturbent.
+        // Solution : relancer avec un message de nudge qui force l'action.
+        const texte = String(reponse.content ?? "").trim();
+        const aDesTools =
+            (reponse.tool_calls?.length > 0) ||
+            (reponse.additional_kwargs?.tool_calls?.length > 0);
+
+        if (!texte && !aDesTools) {
+            console.warn("⚠️  Réponse vide détectée — relance avec nudge...");
+            // NE PAS inclure `reponse` (AIMessage vide) dans le contexte :
+            // Mistral rejette tout AIMessage sans content ni tool_calls (code 400).
+            // On injecte directement un HumanMessage de relance.
+            const messagesAvecNudge = [
+                ...allMessagesFenetre,
+                new HumanMessage(
+                    "[RELANCE] Ta réponse précédente était vide. " +
+                    "Tu dois OBLIGATOIREMENT utiliser les outils disponibles. " +
+                    "Commence maintenant par l'action la plus logique."
+                ),
+            ];
+            const reponseNudge = await multiLLM.invoke(sanitiserMessages(messagesAvecNudge));
+            console.log("Réponse après nudge reçue.");
+            return { messages: [normaliserToolCallIds(reponseNudge)] };
+        }
+
+        return { messages: [normaliserToolCallIds(reponse)] };
+
+    } catch (error: any) {
+        console.error("Erreur definitive noeudLLM:", error?.message);
+
+        // Contexte trop cassé (tous les providers ont SKIPpé) → fallback nucléaire
+        // On réessaie avec uniquement le dernier message humain, contexte vide
+        if (error?.message === "CONTEXT_INCOMPATIBLE") {
+            console.warn("⚠️  FALLBACK NUCLÉAIRE : clearContext + relance message brut");
+            const dernierHuman = etat.messages.filter(m => m instanceof HumanMessage).at(-1);
+            if (dernierHuman) {
+                try {
+                    await contextManager.clearContext(); // Vider l'historique cassé
+                    const reponseNucleaire = await multiLLM.invoke([
+                        new HumanMessage(
+                            "Tu es un agent IA autonome. Réponds en français. " +
+                            "Message : " + String(dernierHuman.content)
+                        )
+                    ]);
+                    console.log("Réponse fallback nucléaire reçue.");
+                    return { messages: [normaliserToolCallIds(reponseNucleaire)] };
+                } catch (e2: any) {
+                    console.error("Fallback nucléaire échoué:", e2?.message);
+                }
+            }
+        }
+
+        const isQuotaEpuise = error?.message?.includes("Tous les providers");
+        const messageErreur = isQuotaEpuise
+            ? "ERREUR QUOTA : Tous les providers LLM sont epuises. Attendre demain."
+            : `ERREUR TECHNIQUE [${error?.constructor?.name ?? "Error"}]: ${error?.message ?? "inconnue"}\n` +
+              `Stack: ${(error?.stack ?? "").split("\n").slice(0, 3).join(" | ")}`;
+        return { messages: [new AIMessage(messageErreur)] };
+    }
+}
+
+async function noeudOutils(etat: typeof EtatAgent.State) {
+    return await toolNodeAvecOffload(etat, toolNodeBase);
+}
+
+function decider(etat: typeof EtatAgent.State): string {
+    const dernierMessage = etat.messages.at(-1);
+
+    const hasToolCalls =
+        (dernierMessage?.tool_calls && dernierMessage.tool_calls.length > 0) ||
+        (dernierMessage?.additional_kwargs?.tool_calls &&
+            (dernierMessage.additional_kwargs.tool_calls as any[]).length > 0) ||
+        ((dernierMessage as any)?.kwargs?.tool_calls &&
+            (dernierMessage as any).kwargs.tool_calls.length > 0);
+
+    if (hasToolCalls) { console.log("decider -> tools"); return "tools"; }
+
+    const texte = String(dernierMessage?.content ?? "").trim();
+    if (!texte) {
+        console.warn("⚠️  decider -> END (réponse vide, nudge non résolu)");
+    } else {
+        console.log("decider -> END");
+    }
+    return END;
+}
+
+const graphe = new StateGraph(EtatAgent)
+    .addNode("llm", noeudLLM)
+    .addNode("tools", noeudOutils)
+    .addEdge(START, "llm")
+    .addConditionalEdges("llm", decider)
+    .addEdge("tools", "llm")
+    .compile();
+
+// API PUBLIQUE
+
+export interface AgentResponse {
+    text: string;
+    screenshot?: string;
+}
+
+export async function traiterMessage(messageUtilisateur: string): Promise<AgentResponse> {
+    try {
+        const messageEntrant = new HumanMessage(messageUtilisateur);
+        await contextManager.addMessage(messageEntrant);
+
+        const resultat = await graphe.invoke(
+            { messages: [messageEntrant] },
+            { recursionLimit: 100 }
+        );
+
+        let screenshotData: string | undefined;
+        for (const msg of resultat.messages) {
+            if (
+                msg instanceof ToolMessage &&
+                typeof msg.content === "string" &&
+                msg.content.startsWith("data:image")
+            ) {
+                screenshotData = msg.content;
+            }
+        }
+
+        const reponseFinale = resultat.messages.at(-1);
+        let contenu = String(reponseFinale?.content ?? "Pas de reponse.");
+        if (!contenu.trim()) contenu = "[L'agent n'a pas genere de reponse textuelle.]";
+
+        await contextManager.addMessage(new AIMessage(contenu));
+        return { text: contenu, screenshot: screenshotData };
+
+    } catch (error) {
+        console.error("Erreur dans traiterMessage:", error);
+        const fallback = "Desole, une erreur interne est survenue.";
+        await contextManager.addMessage(new AIMessage(fallback));
+        return { text: fallback };
+    }
+}
+
+// INTERFACE CLI
+
+async function demarrerInterface() {
+    console.log("\n" + "=".repeat(65));
+    console.log(" AGENT IA AUTONOME - LangChain + LangGraph + FS-Memory ");
+    console.log("=".repeat(65));
+    console.log("Providers (fallback automatique) :");
+    PROVIDERS_CHAIN.forEach((p, i) =>
+        console.log(`  ${i + 1}. ${p.name.padEnd(26)} ${p.rpm} req/min`)
+    );
+    console.log("FS-Memory : ./agent-memory/ (offload auto des gros resultats)");
+    console.log("-".repeat(65));
+    console.log("  'exit' -> Quitter | 'reset' -> Memoire | 'tools' -> Liste");
+    console.log("=".repeat(65) + "\n");
+
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+    const LireQuestion = () => {
+        rl.question(`Tu [${multiLLM.getCurrentProviderName()}] : `, async (input) => {
+            const msg = input.trim();
+            if (!msg) { LireQuestion(); return; }
+
+            if (msg.toLowerCase() === "exit") {
+                console.log("\n Fermeture...");
+                await navigateur.fermer();
+                await e2bSandbox.fermer();
+                rl.close();
+                process.exit(0);
+            }
+            if (msg.toLowerCase() === "reset") {
+                await memoireConversation.clear();
+                console.log(" Memoire effacee.\n");
+                LireQuestion(); return;
+            }
+            if (msg.toLowerCase() === "tools") {
+                console.log("\n Tools disponibles :");
+                TOUS_LES_TOOLS.forEach(t =>
+                    console.log(`  - ${t.name}: ${t.description.slice(0, 70)}...`)
+                );
+                console.log();
+                LireQuestion(); return;
+            }
+
+            console.log(`\n Agent reflechit... [${multiLLM.getCurrentProviderName()}]\n`);
+            try {
+                const response = await traiterMessage(msg);
+                console.log(`\n Agent : ${response.text}\n`);
+                console.log("-".repeat(65) + "\n");
+            } catch (error) {
+                console.error(`Erreur : ${(error as Error).message}\n`);
+            }
+            LireQuestion();
+        });
+    };
+
+    LireQuestion();
+}
+
+if (require.main === module) {
+    demarrerInterface().catch(err => console.error("Erreur interface console:", err));
 }
