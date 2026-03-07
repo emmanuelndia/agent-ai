@@ -248,16 +248,28 @@ const PROVIDERS_CHAIN: ProviderConfig[] = [
 ];
 
 class MultiProviderLLM {
-    private currentIndex = 0;
-    private rateLimiters = new Map<number, RateLimiter>();
-    private instances    = new Map<number, any>();
+    // ── État par provider ─────────────────────────────────────────────────────
+    // quotaEpuise[i] = true  → quota journalier épuisé, skip définitivement
+    // rateLimitedUntil[i]    → timestamp jusqu'auquel ce provider est en cooldown
+    //
+    // IMPORTANT : ces états persistent entre les requêtes (même instance).
+    // currentIndex est recalculé dynamiquement à chaque invoke() pour trouver
+    // le premier provider disponible — il ne se bloque plus jamais en fin de liste.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private quotaEpuise      = new Map<number, boolean>();
+    private rateLimitedUntil = new Map<number, number>();
+    private rateLimiters     = new Map<number, RateLimiter>();
+    private instances        = new Map<number, any>();
     private tools: any[];
 
     constructor(tools: any[]) {
         this.tools = tools;
-        PROVIDERS_CHAIN.forEach((p, i) =>
-            this.rateLimiters.set(i, new RateLimiter(p.rpm))
-        );
+        PROVIDERS_CHAIN.forEach((p, i) => {
+            this.rateLimiters.set(i, new RateLimiter(p.rpm));
+            this.quotaEpuise.set(i, false);
+            this.rateLimitedUntil.set(i, 0);
+        });
     }
 
     private getInstance(index: number): any {
@@ -268,53 +280,107 @@ class MultiProviderLLM {
         return this.instances.get(index)!;
     }
 
+    // Retourne le premier provider disponible (non épuisé, non en cooldown)
+    private premierDisponible(): number {
+        const now = Date.now();
+        for (let i = 0; i < PROVIDERS_CHAIN.length; i++) {
+            if (this.quotaEpuise.get(i)) continue;
+            if ((this.rateLimitedUntil.get(i) ?? 0) > now) continue;
+            return i;
+        }
+        return -1; // tous épuisés
+    }
+
     getCurrentProviderName(): string {
-        return PROVIDERS_CHAIN[this.currentIndex]?.name ?? "Aucun";
+        const i = this.premierDisponible();
+        return i >= 0 ? PROVIDERS_CHAIN[i].name : "Aucun";
+    }
+
+    // Réinitialise les rate limits (pas les quotas épuisés) pour un nouveau jour
+    resetRateLimits(): void {
+        this.rateLimitedUntil.forEach((_, i) => this.rateLimitedUntil.set(i, 0));
+        console.log("Rate limits réinitialisés.");
     }
 
     async invoke(messages: BaseMessage[]): Promise<any> {
-        while (this.currentIndex < PROVIDERS_CHAIN.length) {
-            const config  = PROVIDERS_CHAIN[this.currentIndex];
-            const limiter = this.rateLimiters.get(this.currentIndex)!;
-            const llm     = this.getInstance(this.currentIndex);
+        // Chercher le premier provider disponible — à chaque appel, pas en continu
+        let startIndex = this.premierDisponible();
+
+        if (startIndex < 0) {
+            throw new Error(
+                "Tous les providers LLM ont atteint leur quota journalier. " +
+                "Reessaie demain ou active la facturation sur une cle API."
+            );
+        }
+
+        // Essayer chaque provider disponible dans l'ordre
+        for (let i = startIndex; i < PROVIDERS_CHAIN.length; i++) {
+            if (this.quotaEpuise.get(i)) continue;
+
+            const now = Date.now();
+            const cooldownUntil = this.rateLimitedUntil.get(i) ?? 0;
+            if (cooldownUntil > now) {
+                const wait = cooldownUntil - now;
+                console.log(`⏳ [${PROVIDERS_CHAIN[i].name}] en cooldown, attente ${Math.round(wait/1000)}s...`);
+                await sleep(wait);
+            }
+
+            const config  = PROVIDERS_CHAIN[i];
+            const limiter = this.rateLimiters.get(i)!;
+            const llm     = this.getInstance(i);
 
             for (let attempt = 0; attempt < config.maxRetries; attempt++) {
                 try {
                     await limiter.wait();
                     console.log(`[${config.name}] tentative ${attempt + 1}/${config.maxRetries}`);
-                    return await llm.invoke(messages);
+                    const result = await llm.invoke(messages);
+                    // Succès → retirer le cooldown éventuel
+                    this.rateLimitedUntil.set(i, 0);
+                    return result;
                 } catch (error: any) {
                     const kind = classifierErreur(error);
                     console.warn(`[${config.name}] ${kind} : ${String(error?.message).slice(0, 120)}`);
 
                     switch (kind) {
                         case "QUOTA_EXHAUSTED":
-                            console.warn(`Quota epuise sur [${config.name}] -> provider suivant...`);
-                            attempt = config.maxRetries;
+                            // Quota épuisé de façon permanente (journée) → marquer et passer au suivant
+                            console.warn(`Quota epuise sur [${config.name}] → skip définitif pour cette session`);
+                            this.quotaEpuise.set(i, true);
+                            attempt = config.maxRetries; // sortir de la boucle de retries
                             break;
+
                         case "RATE_LIMIT": {
                             const match   = error?.message?.match(/retry.*?(\d+(?:\.\d+)?)\s*s/i);
                             const suggest = match ? parseFloat(match[1]) * 1000 : 0;
                             const waitMs  = Math.max(suggest, Math.pow(2, attempt + 1) * 1000);
                             console.warn(`Rate limit - attente ${Math.round(waitMs / 1000)}s...`);
+                            // Mémoriser le cooldown pour ne pas réessayer avant ce délai
+                            this.rateLimitedUntil.set(i, Date.now() + waitMs);
                             await sleep(waitMs);
                             break;
                         }
+
                         case "RETRYABLE": {
                             const waitMs = Math.pow(2, attempt + 1) * 1000;
                             console.warn(`Erreur temporaire - attente ${Math.round(waitMs / 1000)}s...`);
                             await sleep(waitMs);
                             break;
                         }
+
                         case "FATAL":
                             throw error;
                     }
                 }
             }
 
-            this.currentIndex++;
-            if (this.currentIndex < PROVIDERS_CHAIN.length) {
-                console.log(`Nouveau provider : ${PROVIDERS_CHAIN[this.currentIndex].name}`);
+            // Si on sort de la boucle de retries sans succès et sans exception fatale :
+            // c'est soit quota épuisé, soit rate limit dépassé → passer au suivant
+            if (!this.quotaEpuise.get(i)) {
+                console.log(`[${config.name}] retries épuisés → provider suivant`);
+            }
+            const nextAvail = this.premierDisponible();
+            if (nextAvail > i) {
+                console.log(`Nouveau provider : ${PROVIDERS_CHAIN[nextAvail].name}`);
             }
         }
 
