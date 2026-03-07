@@ -34,7 +34,7 @@ const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, m
 
 type ErrorKind =
     | "QUOTA_EXHAUSTED"  // quota journalier épuisé → skip définitif dans la session
-    | "SKIP_REQUEST"     // erreur de format pour CETTE requête → skip mais provider réutilisable
+    | "SKIP"     // erreur de format pour CETTE requête → skip mais provider réutilisable
     | "RATE_LIMIT"       // trop de requêtes → attendre et réessayer
     | "RETRYABLE"        // erreur temporaire → réessayer
     | "FATAL";           // erreur irrécupérable → stopper
@@ -91,12 +91,12 @@ function classifierErreur(error: any): ErrorKind {
         msg.includes("all openai tool calls must have an") ||
         msg.includes("id" field")
     ) {
-        return "SKIP_REQUEST";
+        return "SKIP";
     }
 
     // Gemini thinking : thought_signature manquant → skip cette requête
     if (msg.includes("thought_signature") || msg.includes("missing a thought")) {
-        return "SKIP_REQUEST";
+        return "SKIP";
     }
 
     return "FATAL";
@@ -149,23 +149,27 @@ interface ProviderConfig {
  * │ Gemini gemini-3-flash-preview│   9  │      500 *   │ Dernier recours     │
  * └──────────────────────────────┴──────┴──────────────┴─────────────────────┘
  */
+/**
+ * Chaîne de fallback — ordre optimisé par quota/jour puis qualité.
+ *
+ * STRATÉGIE : illimités en tête, quotas limités en dernier recours.
+ *
+ * ┌──────────────────────────────┬──────┬──────────────┬─────────────────────┐
+ * │ Provider / Modèle            │ RPM  │ Req/jour     │ Notes               │
+ * ├──────────────────────────────┼──────┼──────────────┼─────────────────────┤
+ * │ Cerebras llama-3.3-70b       │  28  │  ILLIMITÉ    │ Principal           │
+ * │ Mistral small                │   4  │  ILLIMITÉ    │ 1 Md tokens/mois    │
+ * │ Groq llama-3.3-70b           │  25  │   14 400     │ Très capable        │
+ * │ Groq llama-3.1-8b            │  25  │   14 400 *   │ Quota séparé        │
+ * │ Gemini 2.0 Flash             │  55  │    1 500     │ Précieux, last res. │
+ * │ Gemini 2.5 Flash             │   9  │      500 *   │ Quota séparé        │
+ * │ Cohere command-r             │  20  │    1 000     │ Skip auto (schema)  │
+ * └──────────────────────────────┴──────┴──────────────┴─────────────────────┘
+ */
 const PROVIDERS_CHAIN: ProviderConfig[] = [
-    // ── 1. Gemini 2.0 Flash — meilleur pour l'agentic (60 RPM)
-    {
-        name: "Gemini 2.0 Flash",
-        rpm: 55,
-        maxRetries: 3,
-        factory: (tools) => new ChatGoogleGenerativeAI({
-            model: "gemini-2.0-flash",
-            temperature: 0,
-            apiKey: process.env.GOOGLE_API_KEY,
-            maxRetries: 0,
-        }).bindTools(tools),
-    },
 
-    // ── 2. Cerebras llama-3.3-70b — quota illimité, ultra-rapide
-    //       Utilise ChatOpenAI avec baseURL custom : zéro conflit de dépendance,
-    //       car @langchain/cerebras@1.0.x est incompatible avec @langchain/core@0.3.x
+    // ── 1. Cerebras llama-3.3-70b — ILLIMITÉ, très capable, 28 RPM
+    //       Via wrapper OpenAI-compatible (zéro conflit de dépendance)
     {
         name: "Cerebras llama-3.3-70b",
         rpm: 28,
@@ -174,69 +178,13 @@ const PROVIDERS_CHAIN: ProviderConfig[] = [
             model: "llama-3.3-70b",
             temperature: 0,
             apiKey: process.env.CEREBRAS_API_KEY,
-            configuration: {
-                baseURL: "https://api.cerebras.ai/v1",
-            },
-            maxRetries: 0,
-        // strict: false — désactive la validation Zod stricte d'OpenAI
-        // Nécessaire car Cerebras n'impose pas le mode "structured outputs"
-        // et nos tools utilisent .optional() sans .nullable()
-        }).bindTools(tools, { strict: false }),
-    },
-
-    // ── 3. Groq llama-3.3-70b — 14 400 req/jour, très capable
-    {
-        name: "Groq llama-3.3-70b",
-        rpm: 25,
-        maxRetries: 3,
-        factory: (tools) => new ChatGroq({
-            model: "llama-3.3-70b-versatile",
-            temperature: 0,
-            apiKey: process.env.GROQ_API_KEY,
-            maxRetries: 0,
-        }).bindTools(tools),
-    },
-
-    // ── 4. Cohere command-r
-    {
-        name: "Cohere command-r",
-        rpm: 20,
-        maxRetries: 3,
-        factory: (tools) => new ChatCohere({
-            model: "command-r",
-            temperature: 0,
-            apiKey: process.env.COHERE_API_KEY,
+            configuration: { baseURL: "https://api.cerebras.ai/v1" },
             maxRetries: 0,
         }).bindTools(tools, { strict: false }),
     },
 
-    // ── 5. Groq llama-3.1-8b — quota SÉPARÉ du 3.3-70b, très rapide
-    {
-        name: "Groq llama-3.1-8b",
-        rpm: 25,
-        maxRetries: 3,
-        factory: (tools) => new ChatGroq({
-            model: "llama-3.1-8b-instant",
-            temperature: 0,
-            apiKey: process.env.GROQ_API_KEY,
-            maxRetries: 0,
-        }).bindTools(tools),
-    },
-
-    // ── 6. Gemini 2.5 Flash — quota SÉPARÉ du 2.0 Flash
-    {
-        name: "Gemini 2.5 Flash",
-        rpm: 9,
-        maxRetries: 3,
-        factory: (tools) => new ChatGoogleGenerativeAI({
-            model: "gemini-2.5-flash",
-            temperature: 0,
-            apiKey: process.env.GOOGLE_API_KEY,
-            maxRetries: 0,
-        }).bindTools(tools),
-    },
-
-    // ── 7. Mistral small — 1 milliard de tokens/mois gratuits
+    // ── 2. Mistral small — ILLIMITÉ (1 Md tokens/mois), 4 RPM
+    //       Illimité mais lent → backup direct de Cerebras
     {
         name: "Mistral small",
         rpm: 4,
@@ -249,10 +197,74 @@ const PROVIDERS_CHAIN: ProviderConfig[] = [
         }).bindTools(tools),
     },
 
-    // ── 8. Gemini gemini-3-flash-preview — DÉSACTIVÉ
-    // Ce modèle exige des "thought_signatures" sur les tool_calls
-    // provenant d'autres providers → incompatible en chaîne de fallback.
-    // Voir : https://ai.google.dev/gemini-api/docs/thought-signatures
+    // ── 3. Groq llama-3.3-70b — 14 400 req/jour, très capable, 25 RPM
+    {
+        name: "Groq llama-3.3-70b",
+        rpm: 25,
+        maxRetries: 3,
+        factory: (tools) => new ChatGroq({
+            model: "llama-3.3-70b-versatile",
+            temperature: 0,
+            apiKey: process.env.GROQ_API_KEY,
+            maxRetries: 0,
+        }).bindTools(tools),
+    },
+
+    // ── 4. Groq llama-3.1-8b — quota SÉPARÉ du 3.3-70b
+    {
+        name: "Groq llama-3.1-8b",
+        rpm: 25,
+        maxRetries: 3,
+        factory: (tools) => new ChatGroq({
+            model: "llama-3.1-8b-instant",
+            temperature: 0,
+            apiKey: process.env.GROQ_API_KEY,
+            maxRetries: 0,
+        }).bindTools(tools),
+    },
+
+    // ── 5. Gemini 2.0 Flash — 1 500 req/jour, meilleur pour l'agentic
+    //       Quota PRÉCIEUX → réservé en dernier recours
+    {
+        name: "Gemini 2.0 Flash",
+        rpm: 55,
+        maxRetries: 3,
+        factory: (tools) => new ChatGoogleGenerativeAI({
+            model: "gemini-2.0-flash",
+            temperature: 0,
+            apiKey: process.env.GOOGLE_API_KEY,
+            maxRetries: 0,
+        }).bindTools(tools),
+    },
+
+    // ── 6. Gemini 2.5 Flash — 500 req/jour, quota SÉPARÉ du 2.0
+    {
+        name: "Gemini 2.5 Flash",
+        rpm: 9,
+        maxRetries: 3,
+        factory: (tools) => new ChatGoogleGenerativeAI({
+            model: "gemini-2.5-flash",
+            temperature: 0,
+            apiKey: process.env.GOOGLE_API_KEY,
+            maxRetries: 0,
+        }).bindTools(tools),
+    },
+
+    // ── 7. Cohere command-r — sera skipé auto (incompatibilité schema tools)
+    //       Gardé comme dernier filet
+    {
+        name: "Cohere command-r",
+        rpm: 20,
+        maxRetries: 3,
+        factory: (tools) => new ChatCohere({
+            model: "command-r",
+            temperature: 0,
+            apiKey: process.env.COHERE_API_KEY,
+            maxRetries: 0,
+        }).bindTools(tools, { strict: false }),
+    },
+
+    // gemini-3-flash-preview DÉSACTIVÉ : exige thought_signatures incompatibles
 ];
 
 class MultiProviderLLM {
@@ -357,7 +369,7 @@ class MultiProviderLLM {
                             attempt = config.maxRetries;
                             break;
 
-                        case "SKIP_REQUEST":
+                        case "SKIP":
                             // Erreur de format pour CETTE requête (ex: tool_call sans id, message_order)
                             // → skip ce provider pour cette requête UNIQUEMENT, pas définitivement
                             console.warn(`[${config.name}] format incompatible pour cette requête → skip (provider conservé)`);
@@ -571,6 +583,13 @@ function sanitiserMessages(messages: BaseMessage[]): BaseMessage[] {
             console.warn(`⚠️  Sanitise Passe 0 : tool_call sans id (${tc.name}) → id généré: ${newId}`);
             return { ...tc, id: newId };
         });
+        // Vérification : si l'id n'est toujours pas assignable, nettoyer les tool_calls
+        // (Groq rejette en FATAL tout AIMessage avec un tool_call sans id)
+        const stillBroken = fixedToolCalls.some((tc: any) => !tc.id);
+        if (stillBroken) {
+            console.warn(`⚠️  Sanitise Passe 0 : tool_calls irrécupérables → AIMessage nettoyé`);
+            return new AIMessage({ content: String(msg.content ?? ""), tool_calls: [] });
+        }
         return new AIMessage({
             content: msg.content,
             tool_calls: fixedToolCalls,
