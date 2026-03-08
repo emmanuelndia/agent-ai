@@ -4,7 +4,7 @@ import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 // Mistral est maintenant utilisé via ChatOpenAI + baseURL "https://api.mistral.ai/v1" (OpenAI-compatible).
 import { ChatOpenAI } from "@langchain/openai";   // ← Cerebras via wrapper OpenAI-compatible
 import { ChatCohere } from "@langchain/cohere";
-
+import { ChatOllama } from "@langchain/ollama";
 // ChatCerebras (@langchain/cerebras) SUPPRIMÉ : incompatible avec @langchain/core@0.3.x
 // Cerebras est utilisé via ChatOpenAI avec baseURL custom (zéro conflit de dépendance)
 import { StateGraph, Annotation, END, START } from "@langchain/langgraph";
@@ -167,6 +167,17 @@ interface ProviderConfig {
  * └──────────────────────────────┴──────┴──────────────┴─────────────────────┘
  */
 const PROVIDERS_CHAIN: ProviderConfig[] = [
+
+    {
+        name: "Ollama (Railway)",
+        rpm: 100,
+        maxRetries: 2,
+        factory: (tools) => new ChatOllama({
+            baseUrl: process.env.OLLAMA_PUBLIC_URL,
+            model: "llama3.2:3b",   // ou le modèle que vous avez téléchargé
+            temperature: 0,
+        }).bindTools(tools),
+    },
 
     // ── 1. Cerebras gpt-oss-120b — ILLIMITÉ, 30 RPM, 120B params
     {
