@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useRef, useEffect } from 'react';
+import { useState } from 'react';
 
 interface ContextStats {
   totalMessages: number;
@@ -9,238 +9,216 @@ interface ContextStats {
   compressionRatio: number;
 }
 
-interface ChatMessage {
-  role: 'user' | 'agent';
-  text: string;
-  screenshot?: string | null;
-  timestamp: string;
+interface ChatResponse {
+  response: string;
+  screenshot?: string | null; // ✅ Nouveau champ pour les captures d'écran
   context?: ContextStats;
+  timestamp: string;
 }
 
 export default function Home() {
   const [message, setMessage] = useState('');
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [response, setResponse] = useState('');
+  const [screenshot, setScreenshot] = useState<string | null>(null); // ✅ État pour le screenshot
+  const [context, setContext] = useState<ContextStats | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  const messagesEndRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
-
-  // Auto-scroll vers le bas à chaque nouveau message
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, loading]);
 
   const sendMessage = async () => {
-    if (!message.trim() || loading) return;
+    if (!message.trim()) return;
 
-    const userMsg: ChatMessage = {
-      role: 'user',
-      text: message.trim(),
-      timestamp: new Date().toISOString(),
-    };
-
-    setMessages(prev => [...prev, userMsg]);
-    setMessage('');
     setLoading(true);
     setError('');
+    setResponse('');
+    setScreenshot(null); // ✅ Réinitialiser le screenshot
+    setContext(null);
 
     try {
       const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/chat`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: userMsg.text }),
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ message }),
       });
 
+      // SI ERREUR
       if (!res.ok) {
-        const errorText = await res.text();
-        throw new Error(`Serveur ${res.status} — ${errorText}`);
+        const errorText = await res.text(); // On lit l'erreur ici
+        console.error("Erreur serveur:", errorText);
+        throw new Error(`Le serveur a répondu: ${res.status} - ${errorText}`);
       }
 
-      const data = await res.json();
+      // SI SUCCÈS (On ne lit le JSON qu'ici)
+      const data: ChatResponse = await res.json();
+      console.log("Réponse reçue:", data.response);
+      setResponse(data.response);
+      setScreenshot(data.screenshot ?? null); // ✅ Stocker le screenshot s'il existe
+      setContext(data.context || null);     
 
-      const agentMsg: ChatMessage = {
-        role: 'agent',
-        text: data.response,
-        screenshot: data.screenshot ?? null,
-        timestamp: data.timestamp,
-        context: data.context,
-      };
-
-      setMessages(prev => [...prev, agentMsg]);
     } catch (err) {
       setError((err as Error).message);
     } finally {
       setLoading(false);
-      inputRef.current?.focus();
     }
   };
 
   const clearContext = async () => {
-    if (!confirm('Effacer tout le contexte et l\'historique ?')) return;
     try {
       const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/context/clear`, {
         method: 'POST',
       });
-      if (!res.ok) throw new Error('Échec du clear');
-      setMessages([]);
+
+      if (!res.ok) {
+        throw new Error('Failed to clear context');
+      }
+
+      setContext(null);
+      setResponse('');
       setError('');
+      setMessage('');
+      alert('Contexte effacé avec succès!');
     } catch (err) {
       setError((err as Error).message);
     }
   };
 
-  const lastContext = [...messages].reverse().find(m => m.context)?.context;
+  const getContextStats = async () => {
+    try {
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/context/stats`);
+      
+      if (!res.ok) {
+        throw new Error('Failed to get context stats');
+      }
 
-  const formatTime = (iso: string) => {
-    try { return new Date(iso).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }); }
-    catch { return ''; }
+      const data = await res.json();
+      setContext(data.context);
+    } catch (err) {
+      setError((err as Error).message);
+    }
   };
 
   return (
-    <div className="flex flex-col h-screen bg-gray-100">
-
-      {/* ── Header ── */}
-      <header className="bg-white border-b border-gray-200 px-4 py-3 flex items-center justify-between shadow-sm flex-shrink-0">
-        <div className="flex items-center gap-3">
-          <div className="w-9 h-9 rounded-full bg-blue-600 flex items-center justify-center text-white text-lg">🤖</div>
-          <div>
-            <h1 className="font-bold text-gray-900 text-base leading-tight">Agent IA LangChain</h1>
-            <p className="text-xs text-gray-500">Mistral · E2B Sandbox · Navigation autonome</p>
-          </div>
-        </div>
-        <div className="flex items-center gap-2">
-          {lastContext && (
-            <span className="hidden sm:flex items-center gap-1 text-xs text-blue-600 bg-blue-50 px-2 py-1 rounded-full">
-              📊 {lastContext.currentTokens.toLocaleString()} tokens · {lastContext.compressionRatio}% compressé
-            </span>
-          )}
-          <button
-            onClick={clearContext}
-            className="text-xs px-3 py-1.5 bg-red-50 text-red-600 rounded-lg hover:bg-red-100 transition-colors"
-          >
-            🧹 Clear
-          </button>
-        </div>
-      </header>
-
-      {/* ── Zone de messages ── */}
-      <main className="flex-1 overflow-y-auto px-4 py-4 space-y-4">
-
-        {/* Message de bienvenue si vide */}
-        {messages.length === 0 && (
-          <div className="flex flex-col items-center justify-center h-full text-center text-gray-400 gap-3">
-            <div className="text-5xl">🤖</div>
-            <p className="font-medium text-gray-600">Bonjour ! Je suis votre agent IA autonome.</p>
-            <p className="text-sm max-w-sm">Je peux naviguer sur le web, remplir des formulaires, prendre des captures d'écran et bien plus encore.</p>
-            <div className="flex flex-wrap gap-2 justify-center mt-2">
-              {[
-                "Ouvre un navigateur en mode headless",
-                "Va sur google.com",
-                "Fais une capture d'écran",
-              ].map(s => (
-                <button
-                  key={s}
-                  onClick={() => setMessage(s)}
-                  className="text-xs bg-white border border-gray-200 rounded-full px-3 py-1.5 hover:bg-blue-50 hover:border-blue-300 hover:text-blue-600 transition-colors"
-                >
-                  {s}
-                </button>
-              ))}
+    <div className="min-h-screen bg-gray-50 py-8 px-4">
+      <div className="max-w-4xl mx-auto">
+        <div className="bg-white rounded-lg shadow-lg p-6">
+          <div className="flex justify-between items-center mb-6">
+            <div>
+              <h1 className="text-3xl font-bold text-gray-900 mb-2">
+                Agent IA LangChain
+              </h1>
+              {/* <p className="text-gray-600">
+                Interface avec ingénierie de contexte avancée
+              </p> */}
             </div>
+            {/* <div className="flex gap-2">
+              <button
+                onClick={getContextStats}
+                className="px-3 py-1 bg-blue-100 text-blue-700 rounded-md hover:bg-blue-200 text-sm"
+              >
+                📊 Stats
+              </button>
+              <button
+                onClick={clearContext}
+                className="px-3 py-1 bg-red-100 text-red-700 rounded-md hover:bg-red-200 text-sm"
+              >
+                🧹 Clear
+              </button>
+            </div> */}
           </div>
-        )}
 
-        {/* Bulles de messages */}
-        {messages.map((msg, i) => (
-          <div key={i} className={`flex gap-3 ${msg.role === 'user' ? 'flex-row-reverse' : 'flex-row'}`}>
-
-            {/* Avatar */}
-            <div className={`w-8 h-8 rounded-full flex-shrink-0 flex items-center justify-center text-sm
-              ${msg.role === 'user' ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-600'}`}>
-              {msg.role === 'user' ? '👤' : '🤖'}
-            </div>
-
-            {/* Contenu */}
-            <div className={`max-w-[75%] space-y-2 ${msg.role === 'user' ? 'items-end' : 'items-start'} flex flex-col`}>
-              <div className={`rounded-2xl px-4 py-2.5 text-sm leading-relaxed whitespace-pre-wrap
-                ${msg.role === 'user'
-                  ? 'bg-blue-600 text-white rounded-tr-sm'
-                  : 'bg-white text-gray-800 border border-gray-200 rounded-tl-sm shadow-sm'
-                }`}>
-                {msg.text}
-              </div>
-
-              {/* Screenshot */}
-              {msg.screenshot && (
-                <div className="bg-white border border-gray-200 rounded-xl overflow-hidden shadow-sm">
-                  <div className="px-3 py-1.5 bg-gray-50 border-b border-gray-200 flex items-center gap-1.5">
-                    <span className="w-2.5 h-2.5 rounded-full bg-red-400"></span>
-                    <span className="w-2.5 h-2.5 rounded-full bg-yellow-400"></span>
-                    <span className="w-2.5 h-2.5 rounded-full bg-green-400"></span>
-                    <span className="text-xs text-gray-400 ml-1">Capture d'écran</span>
-                  </div>
-                  <img
-                    src={msg.screenshot}
-                    alt="Capture d'écran du navigateur"
-                    className="max-w-full block"
-                  />
+          {/* Context Stats */}
+          {context && (
+            <div className="mb-6 p-4 bg-blue-50 rounded-lg">
+              <h3 className="font-semibold text-blue-800 mb-2">📊 Statistiques du Contexte:</h3>
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+                <div>
+                  <span className="text-blue-600">Messages:</span>
+                  <div className="font-bold text-blue-900">{context.totalMessages}</div>
                 </div>
-              )}
-
-              {/* Timestamp + stats de contexte */}
-              <span className="text-xs text-gray-400">{formatTime(msg.timestamp)}</span>
-            </div>
-          </div>
-        ))}
-
-        {/* Indicateur de chargement */}
-        {loading && (
-          <div className="flex gap-3">
-            <div className="w-8 h-8 rounded-full bg-gray-200 flex items-center justify-center text-sm">🤖</div>
-            <div className="bg-white border border-gray-200 rounded-2xl rounded-tl-sm px-4 py-3 shadow-sm">
-              <div className="flex gap-1.5 items-center">
-                <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></span>
-                <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></span>
-                <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></span>
+                <div>
+                  <span className="text-blue-600">Tokens:</span>
+                  <div className="font-bold text-blue-900">{context.currentTokens.toLocaleString()}</div>
+                </div>
+                <div>
+                  <span className="text-blue-600">Résumés:</span>
+                  <div className="font-bold text-blue-900">{context.summariesCount}</div>
+                </div>
+                <div>
+                  <span className="text-blue-600">Compression:</span>
+                  <div className="font-bold text-blue-900">{context.compressionRatio}%</div>
+                </div>
               </div>
             </div>
-          </div>
-        )}
+          )}
 
-        {/* Erreur */}
-        {error && (
-          <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-xl text-sm">
-            ⚠️ <strong>Erreur :</strong> {error}
-          </div>
-        )}
+          <div className="space-y-6">
+            {/* Input Section */}
+            <div className="border rounded-lg p-4">
+              <label htmlFor="message" className="block text-sm font-medium text-gray-700 mb-2">
+                Message pour l'agent
+              </label>
+              <div className="flex gap-2">
+                <input
+                  id="message"
+                  type="text"
+                  value={message}
+                  onChange={(e) => setMessage(e.target.value)}
+                  onKeyPress={(e) => e.key === 'Enter' && sendMessage()}
+                  placeholder="Ex: Cherche des informations sur Next.js..."
+                  className="flex-1 px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-900 placeholder-gray-500"
+                  disabled={loading}
+                />
+                <button
+                  onClick={sendMessage}
+                  disabled={loading || !message.trim()}
+                  className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors"
+                >
+                  {loading ? 'Envoi...' : 'Envoyer'}
+                  
+                </button>
+              </div>
+            </div>
 
-        <div ref={messagesEndRef} />
-      </main>
-
-      {/* ── Zone de saisie ── */}
-      <div className="bg-white border-t border-gray-200 px-4 py-3 flex-shrink-0">
-        <div className="flex gap-2 max-w-4xl mx-auto">
-          <input
-            ref={inputRef}
-            type="text"
-            value={message}
-            onChange={e => setMessage(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && !e.shiftKey && sendMessage()}
-            placeholder="Envoyer un message à l'agent…"
-            className="flex-1 px-4 py-2.5 bg-gray-100 rounded-xl text-sm text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:bg-white transition-colors"
-            disabled={loading}
-          />
-          <button
-            onClick={sendMessage}
-            disabled={loading || !message.trim()}
-            className="px-4 py-2.5 bg-blue-600 text-white rounded-xl hover:bg-blue-700 disabled:bg-gray-300 disabled:cursor-not-allowed transition-colors text-sm font-medium flex items-center gap-1.5"
-          >
-            {loading ? (
-              <span className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
-            ) : (
-              <>Envoyer <span>↩</span></>
+            {/* Error Section */}
+            {error && (
+              <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-md">
+                <strong>Erreur:</strong> {error}
+              </div>
             )}
-          </button>
+
+            {/* Response Section */}
+            {(response || screenshot) && (
+              <div className="bg-green-50 border border-green-200 rounded-lg p-4 space-y-3">
+                <h3 className="font-semibold text-green-800 mb-2">Réponse de l'agent:</h3>
+
+                {/* ✅ Texte de l'agent (toujours affiché s'il existe) */}
+                {response && (
+                  <div className="text-gray-700 whitespace-pre-wrap">{response}</div>
+                )}
+
+                {/* ✅ Screenshot affiché séparément sous le texte */}
+                {screenshot && (
+                  <div>
+                    <p className="text-sm text-green-700 font-medium mb-1">📸 Capture d'écran :</p>
+                    <img
+                      src={screenshot}
+                      alt="Capture d'écran du navigateur"
+                      className="max-w-full rounded border border-green-300 shadow-sm"
+                    />
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Loading State */}
+            {loading && (
+              <div className="flex items-center justify-center py-8">
+                <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
+                <span className="ml-2 text-gray-600">L'agent réfléchit...</span>
+              </div>
+            )}
+          </div>
         </div>
       </div>
     </div>

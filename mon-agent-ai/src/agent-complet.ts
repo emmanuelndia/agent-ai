@@ -71,6 +71,13 @@ function classifierErreur(error: any): ErrorKind {
         msg.includes("unavailable")
     ) return "RETRYABLE";
 
+    // Mistral SDK : retente les 429 en interne jusqu'à 5x puis throw "Max retries reached"
+    // Le maxRetries:0 de ChatMistralAI n'est pas respecté par le SDK natif @mistralai/mistralai
+    // → classifier comme RATE_LIMIT pour mettre le provider en cooldown au lieu de crasher
+    if (msg.includes("max retries reached") || msg.includes("max retries exceeded")) {
+        return "RATE_LIMIT";
+    }
+
     // 404 = modèle introuvable → passer au suivant
     if (status === 404 || msg.includes("model_not_found") || msg.includes("no body")) {
         return "QUOTA_EXHAUSTED";
@@ -90,6 +97,8 @@ function classifierErreur(error: any): ErrorKind {
         msg.includes("invalid_request_message") ||
         msg.includes("all openai tool calls must have an") ||
         msg.includes("\"id\" field") ||
+        // Mistral : nombre de tool_calls ≠ nombre de ToolMessages dans le contexte
+        msg.includes("not the same number of function calls") ||
         // Mistral rejette un AIMessage avec content="" ET sans tool_calls
         // Se produit quand un provider renvoie une réponse vide et qu'on la passe en contexte
         msg.includes("assistant message must have either content or tool_calls")
@@ -502,6 +511,9 @@ OUTILS DISPONIBLES :
 Navigation (E2B Sandbox) :
   - demarrer_sandbox, aller_vers_e2b, cliquer_e2b, taper_e2b
   - lire_page_e2b, screenshot_e2b, attendre_e2b, cocher_case_e2b, scroller_e2b
+  - appuyer_touche_e2b     : appuie sur Enter/Tab/Escape pour valider un formulaire
+  - selectionner_option_e2b : choisit une option dans un menu deroulant <select>
+  - evaluer_js_e2b          : execute du JavaScript sur la page (lecture/ecriture DOM)
 
 Fichiers de base :
   - calculer, lire_fichier, ecrire_fichier, lister_fichiers, obtenir_date
@@ -513,16 +525,9 @@ Debug :
   - diagnostic_navigateur, tester_selecteur
 
 FS-Memory (PRIORITAIRE pour les grands resultats) :
-  - grep_memoire       : chercher un mot dans un fichier sauvegarde
-  - lire_lignes        : lire des lignes precises d'un fichier
-  - rechercher_glob    : lister les fichiers par pattern
-  - ecrire_decouverte  : sauvegarder une info importante trouvee
-  - ecrire_plan        : sauvegarder un plan avant une tache complexe
-  - mettre_a_jour_todo : mettre a jour la todo-list de la tache en cours
-  - lire_todo          : lire la todo-list courante
-  - apprendre_instruction : memoriser une instruction de l'utilisateur
-  - lire_instructions  : charger les instructions des sessions precedentes
-  - resume_session     : voir tous les fichiers crees dans la session
+  - grep_memoire, lire_lignes, rechercher_glob, ecrire_decouverte
+  - ecrire_plan, mettre_a_jour_todo, lire_todo
+  - apprendre_instruction, lire_instructions, resume_session
 
 REGLE FONDAMENTALE - GESTION DU CONTEXTE :
 Quand un outil retourne un resultat volumineux (page HTML, longue liste), il est
@@ -530,26 +535,42 @@ AUTOMATIQUEMENT sauvegarde dans ./agent-memory/tool-results/ et tu recois un mes
 court avec le chemin. Utilise grep_memoire ou lire_lignes pour extraire
 UNIQUEMENT les informations dont tu as besoin.
 
+WORKFLOW CREATION DE COMPTE (a suivre dans CET ORDRE) :
+1. generate_mot_de_passe
+2. demarrer_sandbox si pas encore fait
+3. aller_vers_e2b vers la page d'inscription
+4. screenshot_e2b pour voir la page
+5. lire_page_e2b (format html) pour identifier les selecteurs CSS des champs
+6. Pour CHAQUE champ : taper_e2b avec le bon selecteur
+   Si erreur "element not found" : evaluer_js_e2b pour trouver le vrai selecteur :
+   Array.from(document.querySelectorAll('input')).map(e=>e.name+':'+e.type+':'+e.id)
+7. Cocher les cases : cocher_case_e2b
+8. Menus deroulants : selectionner_option_e2b
+9. Valider : cliquer_e2b sur le bouton OU appuyer_touche_e2b "Enter"
+10. attendre_e2b (ms: 2000) apres soumission
+11. screenshot_e2b pour verifier succes ou message d'erreur
+12. sauvegarder_credential avec email + mot de passe + site
+
 REGLES D'OR :
 1. TOUTE tache complexe commence par mettre_a_jour_todo (plan initial).
-2. Apres CHAQUE etape terminee, appelle mettre_a_jour_todo pour cocher l'etape.
-   Cela recite tes objectifs en fin de contexte et evite la derive.
-3. Quand tu trouves une info importante (selecteur CSS, URL), utilise ecrire_decouverte.
-4. Apres une creation de compte, sauvegarde les identifiants avec sauvegarder_credential.
-5. Si tu rencontres une erreur, NOTE-LA dans le todo (champ note de l'etape).
-   Ne cache jamais une erreur — elle met a jour tes croyances et evite la repetition.
+2. Apres CHAQUE etape terminee, coche-la dans mettre_a_jour_todo.
+3. Quand tu trouves un selecteur CSS valide, sauvegarde-le avec ecrire_decouverte.
+4. Apres une creation de compte, sauvegarde TOUJOURS les identifiants avec sauvegarder_credential.
+5. Si un selecteur echoue, essaie dans l'ordre :
+   a. lire_page_e2b (html) pour voir la structure reelle
+   b. evaluer_js_e2b pour lister les inputs : Array.from(document.querySelectorAll('input')).map(e=>e.name+':'+e.id)
+   c. tester_selecteur pour verifier qu'un element existe
 6. Si l'utilisateur te donne un conseil, utilise apprendre_instruction.
-7. SCREENSHOT OBLIGATOIRE : appelle TOUJOURS screenshot_e2b dans ces cas :
-   - L'utilisateur demande explicitement une capture, screenshot ou photo.
-   - Apres chaque navigation (aller_vers_e2b), clic (cliquer_e2b) ou saisie (taper_e2b).
-   - Avant et apres toute action cle sur un formulaire.
-   - Si le navigateur est ouvert et que l'utilisateur pose une question sur la page.
-   NE JAMAIS repondre "j'ai effectue l'action" sans appeler screenshot_e2b juste avant.
-8. Utilise attendre_e2b pour laisser le temps aux elements d'apparaitre.
+7. SCREENSHOT OBLIGATOIRE apres chaque navigation, clic et saisie.
+   NE JAMAIS repondre "j'ai effectue l'action" sans screenshot_e2b juste avant.
+8. Utilise attendre_e2b (ms: 1500) apres chaque soumission de formulaire.
 
 SELECTEURS COURANTS :
-- Google : 'input[name="q"]', 'textarea[name="q"]'
-- Formulaires : privilegier les selecteurs par texte (ex: button:has-text('Se connecter'))`;
+- Email    : input[type="email"], input[name="email"], #email
+- Password : input[type="password"], input[name="password"], #password
+- Prenom   : input[name="first_name"], input[name="name"], #name
+- Submit   : button[type="submit"], input[type="submit"]
+- Google   : input[name="q"], textarea[name="q"]`;
 
 function construireSystemePrompt(): string {
     return SYSTEME_PROMPT_BASE + chargerInstructionsMemoire();
@@ -560,194 +581,203 @@ function construireSystemePrompt(): string {
 // SANITISATION DES MESSAGES POUR PROVIDERS STRICTS (Mistral)
 //
 // Mistral exige :
-//   1. Chaque ToolMessage a un tool_call_id valide avec AIMessage parent
-//   2. Dernier message = Human ou Tool (jamais AI)
+//   1. Pour chaque tool_call dans un AIMessage, UN ToolMessage correspondant
+//   2. Pas d'AIMessage entre les ToolMessages d'un même AIMessage
+//   3. Dernier message = HumanMessage ou ToolMessage (jamais AIMessage)
+//
+// Architecture : traitement PAR PAIRES ATOMIQUES (AIMessage + ses ToolMessages)
+//   → élimine la cascade d'orphelins des anciennes passes séquentielles P0→P4
 // ─────────────────────────────────────────────────────────────────────────────
+
+/** Extrait tous les tool_calls d'un AIMessage (LangChain + additional_kwargs) */
+function extraireToolCalls(msg: AIMessage): Array<{ id: string; name: string; args: any }> {
+    // Source 1 : msg.tool_calls (format LangChain canonique)
+    const lcCalls = (msg.tool_calls ?? []).filter((tc: any) => !!tc.id);
+
+    if (lcCalls.length > 0) {
+        return lcCalls.map((tc: any) => ({
+            id  : tc.id as string,
+            name: tc.name,
+            args: tc.args,
+        }));
+    }
+
+    // Source 2 : additional_kwargs.tool_calls (format brut provider)
+    const akCalls = (msg.additional_kwargs?.tool_calls as any[]) ?? [];
+    return akCalls
+        .filter((tc: any) => !!tc.id)
+        .map((tc: any) => ({
+            id  : tc.id as string,
+            name: tc.function?.name ?? tc.name ?? "unknown",
+            args: (() => {
+                try { return JSON.parse(tc.function?.arguments ?? tc.arguments ?? "{}"); }
+                catch { return {}; }
+            })(),
+        }));
+}
+
+/** Reconstruit un AIMessage normalisé (additional_kwargs en format OpenAI standard) */
+function normaliserAIMessage(msg: AIMessage, toolCalls: Array<{ id: string; name: string; args: any }>): AIMessage {
+    const akNormalisé = toolCalls.map(tc => ({
+        id      : tc.id,
+        type    : "function" as const,
+        function: {
+            name     : tc.name,
+            arguments: typeof tc.args === "string" ? tc.args : JSON.stringify(tc.args ?? {}),
+        },
+    }));
+    const lcCalls = toolCalls.map(tc => ({
+        id  : tc.id,
+        name: tc.name,
+        args: tc.args,
+        type: "tool_call" as const,
+    }));
+    return new AIMessage({
+        content          : msg.content,
+        tool_calls       : lcCalls,
+        additional_kwargs: { ...msg.additional_kwargs, tool_calls: akNormalisé },
+    });
+}
 
 function sanitiserMessages(messages: BaseMessage[]): BaseMessage[] {
 
     // ═══════════════════════════════════════════════════════════════════════
-    // PASSE 0A : supprimer les AIMessages vides (ni content ni tool_calls)
-    // Mistral rejette code 400 "Assistant message must have either content
-    // or tool_calls" quand un AIMessage vide traîne dans le contexte.
-    // Cela arrive quand un provider (ex: Groq) retourne une réponse vide
-    // et qu'on l'ajoute au contexte pour le nudge.
+    // PHASE 1 : Traitement atomique — parcours linéaire, message par message.
     //
-    // PASSE 0B : normaliser additional_kwargs.tool_calls en format OpenAI
-    // Gemini génère tool_calls avec ids valides MAIS additional_kwargs dans
-    // son propre format (sans id). Groq/Mistral lisent additional_kwargs →
-    // on les reconstruit en format OpenAI standard depuis msg.tool_calls.
+    // Règle fondamentale : un AIMessage avec tool_calls doit être suivi de
+    // EXACTEMENT N ToolMessages, un par tool_call_id (pas moins, pas plus).
+    //
+    // Chaque (AIMessage + ToolMessages[]) est traité comme une UNITÉ ATOMIQUE :
+    //   - Si la paire est incomplète ou incohérente → TOUTE l'unité est rejetée
+    //   - Si la paire est complète → normalisée et conservée
+    //
+    // Les ToolMessages sans parent AIMessage-avec-tools (orphelins) sont supprimés.
     // ═══════════════════════════════════════════════════════════════════════
 
-    const pass0: BaseMessage[] = [];
+    const resultat: BaseMessage[] = [];
     let i = 0;
+
     while (i < messages.length) {
         const msg = messages[i];
 
+        // ── Cas 1 : AIMessage ───────────────────────────────────────────────
         if (msg instanceof AIMessage) {
-            const toolCalls   = msg.tool_calls ?? [];
-            const toolCallsAK = (msg.additional_kwargs?.tool_calls as any[]) ?? [];
-            const content     = String(msg.content ?? "").trim();
-            const hasTools    = toolCalls.length > 0 || toolCallsAK.length > 0;
+            const toolCalls = extraireToolCalls(msg);
+            const content   = String(msg.content ?? "").trim();
 
-            // ── Passe 0A : AIMessage vide → supprimer ──
-            if (!content && !hasTools) {
-                console.warn(`⚠️  Sanitise P0A : AIMessage vide supprimé`);
+            // 1a. AIMessage vide (ni texte ni tools) → supprimer
+            if (!content && toolCalls.length === 0) {
+                console.warn(`⚠️  Sanitise : AIMessage vide supprimé`);
                 i++;
                 continue;
             }
 
-            if (hasTools) {
-                // ── RÈGLE FONDAMENTALE ──────────────────────────────────────────────
-                // msg.tool_calls   = représentation LangChain canonique (avec ids)
-                // additional_kwargs.tool_calls = format brut du provider (Gemini : sans id)
-                //
-                // On NE vérifie les ids QUE dans msg.tool_calls (la source de vérité).
-                // additional_kwargs sera toujours RECONSTRUIT en format OpenAI standard.
-                // Ne jamais supprimer un AIMessage à cause du format de additional_kwargs.
-                // ───────────────────────────────────────────────────────────────────
-
-                // Cas 1 : msg.tool_calls présents avec ids → reconstruire AK et garder
-                if (toolCalls.length > 0 && toolCalls.every(tc => !!tc.id)) {
-                    const akNormalisé = toolCalls.map(tc => ({
-                        id      : tc.id!,
-                        type    : "function" as const,
-                        function: {
-                            name     : tc.name,
-                            arguments: typeof tc.args === "string"
-                                ? tc.args
-                                : JSON.stringify(tc.args ?? {}),
-                        },
-                    }));
-                    pass0.push(new AIMessage({
-                        content          : msg.content,
-                        tool_calls       : toolCalls,
-                        additional_kwargs: { ...msg.additional_kwargs, tool_calls: akNormalisé },
-                    }));
-                    i++;
-                    continue;
-                }
-
-                // Cas 2 : msg.tool_calls présents MAIS certains sans id → irrécupérable
-                if (toolCalls.length > 0 && toolCalls.some(tc => !tc.id)) {
-                    let j = i + 1, skipped = 0;
-                    while (j < messages.length && messages[j] instanceof ToolMessage) { j++; skipped++; }
-                    console.warn(`⚠️  Sanitise P0B : tool_calls sans id → AIMessage supprimé${skipped > 0 ? ` + ${skipped} ToolMessage(s)` : ""}`);
-                    i = j;
-                    continue;
-                }
-
-                // Cas 3 : msg.tool_calls vide mais additional_kwargs non vide
-                // (format provider sans mapping LangChain) → tenter de récupérer les ids depuis AK
-                if (toolCalls.length === 0 && toolCallsAK.length > 0) {
-                    const akHasIds = toolCallsAK.every((tc: any) => !!tc.id);
-                    if (akHasIds) {
-                        // Reconstruire tool_calls LangChain depuis additional_kwargs
-                        const rebuiltToolCalls = toolCallsAK.map((tc: any) => ({
-                            id  : tc.id,
-                            name: tc.function?.name ?? tc.name ?? "unknown",
-                            args: (() => {
-                                try { return JSON.parse(tc.function?.arguments ?? tc.arguments ?? "{}"); }
-                                catch { return {}; }
-                            })(),
-                            type: "tool_call" as const,
-                        }));
-                        pass0.push(new AIMessage({
-                            content          : msg.content,
-                            tool_calls       : rebuiltToolCalls,
-                            additional_kwargs: { ...msg.additional_kwargs, tool_calls: toolCallsAK },
-                        }));
-                        console.warn(`⚠️  Sanitise P0C : tool_calls reconstruits depuis additional_kwargs`);
-                        i++;
-                        continue;
-                    } else {
-                        // AK sans ids → supprimer
-                        let j = i + 1, skipped = 0;
-                        while (j < messages.length && messages[j] instanceof ToolMessage) { j++; skipped++; }
-                        console.warn(`⚠️  Sanitise P0C : additional_kwargs sans id → AIMessage supprimé${skipped > 0 ? ` + ${skipped} ToolMessage(s)` : ""}`);
-                        i = j;
-                        continue;
-                    }
-                }
+            // 1b. AIMessage sans tool_calls → garder tel quel
+            if (toolCalls.length === 0) {
+                resultat.push(msg);
+                i++;
+                continue;
             }
+
+            // 1c. AIMessage avec tool_calls → collecter les ToolMessages suivants
+            const toolMsgsSuivants: ToolMessage[] = [];
+            let j = i + 1;
+            while (j < messages.length && messages[j] instanceof ToolMessage) {
+                toolMsgsSuivants.push(messages[j] as ToolMessage);
+                j++;
+            }
+
+            // Vérifier que chaque tool_call_id est couvert par exactement un ToolMessage
+            const idsAttendus  = new Set(toolCalls.map(tc => tc.id));
+            const idsReçus     = new Set(toolMsgsSuivants.map(tm => tm.tool_call_id).filter(Boolean));
+            const paireValide  =
+                idsAttendus.size === idsReçus.size &&
+                idsAttendus.size > 0 &&
+                [...idsAttendus].every(id => idsReçus.has(id));
+
+            if (paireValide) {
+                // Normaliser l'AIMessage et garder les ToolMessages correspondants
+                resultat.push(normaliserAIMessage(msg, toolCalls));
+                // Garder uniquement les ToolMessages dans l'ordre des tool_calls
+                for (const tc of toolCalls) {
+                    const tm = toolMsgsSuivants.find(t => t.tool_call_id === tc.id)!;
+                    resultat.push(tm);
+                }
+                i = j;
+            } else {
+                // Paire incomplète ou incohérente → rejeter toute l'unité atomique
+                console.warn(
+                    `⚠️  Sanitise : Paire rejetée — ${idsAttendus.size} tool_call(s) ` +
+                    `attendu(s), ${idsReçus.size} ToolMessage(s) reçu(s). ` +
+                    `Ids attendus: [${[...idsAttendus].join(", ")}]`
+                );
+                i = j; // sauter aussi les ToolMessages suivants
+            }
+            continue;
         }
 
-        pass0.push(msg);
+        // ── Cas 2 : ToolMessage non précédé d'un AIMessage-avec-tools (orphelin) ──
+        if (msg instanceof ToolMessage) {
+            // Vérifier si le dernier message dans resultat est bien son parent
+            const prev = resultat.at(-1);
+            const prevEstParent = prev instanceof AIMessage && (
+                (prev.tool_calls?.some((tc: any) => tc.id === msg.tool_call_id)) ||
+                ((prev.additional_kwargs?.tool_calls as any[])?.some(
+                    (tc: any) => tc.id === msg.tool_call_id
+                ))
+            );
+            if (!prevEstParent) {
+                // Ce ToolMessage a été produit hors de notre parcours → orphelin résiduel
+                // (peut arriver si des messages du contextManager se mélangent à etat.messages)
+                console.warn(`⚠️  Sanitise P1 : ToolMessage orphelin ignoré (id: ${msg.tool_call_id ?? "undefined"})`);
+                i++;
+                continue;
+            }
+            // Normalement les ToolMessages sont ajoutés dans le Cas 1c, pas ici
+            // Si on arrive ici c'est un cas rare → garder par prudence
+            resultat.push(msg);
+            i++;
+            continue;
+        }
+
+        // ── Cas 3 : HumanMessage ou autre → garder tel quel ─────────────────
+        resultat.push(msg);
         i++;
     }
 
-    // ── Passe 1 : ToolMessages orphelins ──
-    const pass1: BaseMessage[] = [];
-    for (const msg of pass0) {
-        if (msg instanceof ToolMessage) {
-            const prev = pass1.at(-1);
-            const hasParent = prev instanceof AIMessage && (
-                (prev.tool_calls?.length ?? 0) > 0 ||
-                ((prev.additional_kwargs?.tool_calls as any[])?.length ?? 0) > 0
-            );
-            if (!hasParent || !msg.tool_call_id) {
-                console.warn(`⚠️  Sanitise P1 : ToolMessage orphelin ignoré (id: ${msg.tool_call_id ?? "undefined"})`);
-                continue;
-            }
-        }
-        pass1.push(msg);
-    }
+    // ═══════════════════════════════════════════════════════════════════════
+    // PHASE 2 : Contraintes de format pour Mistral (dernier message)
+    // ═══════════════════════════════════════════════════════════════════════
 
-    // ── Passe 2 : AIMessages avec tool_calls sans ToolMessage suivant ──
-    const pass2: BaseMessage[] = [];
-    for (let i = 0; i < pass1.length; i++) {
-        const msg  = pass1[i];
-        const next = pass1[i + 1];
-        const isAIWithTools = msg instanceof AIMessage && (
-            (msg.tool_calls?.length ?? 0) > 0 ||
-            ((msg.additional_kwargs?.tool_calls as any[])?.length ?? 0) > 0
-        );
-        if (isAIWithTools && !(next instanceof ToolMessage)) {
-            console.warn(`⚠️  Sanitise : AIMessage avec tool_calls sans ToolMessage suivant ignoré`);
-            continue;
-        }
-        pass2.push(msg);
-    }
-
-    // ── Passe 3 : retirer les AIMessages terminaux avec tool_calls ──
-    const result = [...pass2];
-    while (result.length > 0) {
-        const last = result.at(-1)!;
-        const isTrailingToolAI = last instanceof AIMessage && (
-            (last.tool_calls?.length ?? 0) > 0 ||
-            ((last.additional_kwargs?.tool_calls as any[])?.length ?? 0) > 0
-        );
-        if (isTrailingToolAI) {
+    // Supprimer les AIMessages terminaux avec tool_calls (aucune réponse d'outil)
+    while (resultat.length > 0) {
+        const last = resultat.at(-1)!;
+        if (last instanceof AIMessage && (last.tool_calls?.length ?? 0) > 0) {
             console.warn(`⚠️  Sanitise : AIMessage terminal avec tool_calls supprimé`);
-            result.pop();
+            resultat.pop();
         } else {
             break;
         }
     }
 
-    // ── Passe 4 : Mistral refuse si le DERNIER message est un AIMessage (même sans tool_calls)
-    // Après suppression des orphelins, le contexte peut se terminer sur un AIMessage.
-    // On ajoute un HumanMessage invisible pour satisfaire la contrainte de rôle.
-    const last = result.at(-1);
-    if (last instanceof AIMessage) {
-        const lastText = String(last.content ?? "").trim();
-        if (!lastText) {
-            // AIMessage vide en fin → le retirer directement
-            result.pop();
+    // Mistral refuse si le dernier message est un AIMessage (sans tool_calls)
+    const dernierMsg = resultat.at(-1);
+    if (dernierMsg instanceof AIMessage) {
+        const txt = String(dernierMsg.content ?? "").trim();
+        if (!txt) {
+            resultat.pop();
             console.warn(`⚠️  Sanitise : AIMessage vide terminal supprimé`);
         } else {
-            // AIMessage avec contenu → ajouter un Human "relance"
-            result.push(new HumanMessage(
-                "[RELANCE SYSTÈME] Reprends la tâche là où tu t'es arrêté."
-            ));
+            resultat.push(new HumanMessage("[RELANCE SYSTÈME] Reprends la tâche là où tu t'es arrêté."));
             console.warn(`⚠️  Sanitise : HumanMessage de relance ajouté (contexte terminait sur AIMessage)`);
         }
     }
 
-    return result;
+    return resultat;
 }
 
 // GRAPHE LANGGRAPH
+
 
 const EtatAgent = Annotation.Root({
     messages: Annotation<BaseMessage[]>({
@@ -825,11 +855,17 @@ async function noeudLLM(etat: typeof EtatAgent.State) {
         const recent = etat.messages.length > MAX_RECENT
             ? etat.messages.slice(-MAX_RECENT)
             : etat.messages;
-        // Ne jamais commencer sur un AIMessage sans tool_calls (contexte incohérent)
+        // Ne jamais démarrer sur :
+        //   - un AIMessage sans tool_calls (son HumanMessage parent est hors fenêtre)
+        //   - un ToolMessage (son AIMessage parent est hors fenêtre → orphelin immédiat)
+        // Avancer jusqu'au premier HumanMessage ou AIMessage-avec-tools.
         let debut = 0;
-        while (debut < recent.length - 1 &&
-               recent[debut] instanceof AIMessage &&
-               (recent[debut].tool_calls?.length ?? 0) === 0) { debut++; }
+        while (debut < recent.length - 1) {
+            const m = recent[debut];
+            const isAISansTools = m instanceof AIMessage && (m.tool_calls?.length ?? 0) === 0;
+            const isToolMsg     = m instanceof ToolMessage;
+            if (isAISansTools || isToolMsg) { debut++; } else { break; }
+        }
         const allMessagesFenetre = [...optimizedContext, ...recent.slice(debut)];
         // ────────────────────────────────────────────────────────────────────
 
@@ -1046,4 +1082,4 @@ async function demarrerInterface() {
 
 if (require.main === module) {
     demarrerInterface().catch(err => console.error("Erreur interface console:", err));
-}
+}   

@@ -93,7 +93,7 @@ export const screenshotE2B = tool(
         schema: z.object({
             nom: opt(z.string()).describe("Nom du fichier sans extension"),
         }),
-        returnDirect: true,
+        // returnDirect supprimé : coupait le graph après screenshot → agent bloqué mid-task
     }
 );
 
@@ -142,6 +142,51 @@ export const scrollerE2B = tool(
     }
 );
 
+export const appuyerToucheE2B = tool(
+    async ({ touche, selecteur }) => {
+        try { return await e2bSandbox.appuyerTouche({ touche, selecteur: selecteur ?? undefined }); }
+        catch (e) { return `Erreur touche (E2B) : ${(e as Error).message}`; }
+    },
+    {
+        name: "appuyer_touche_e2b",
+        description: "Appuie sur une touche clavier dans la sandbox E2B. Exemples : 'Enter' pour valider un formulaire, 'Tab' pour naviguer entre champs, 'Escape' pour fermer. Peut cibler un élément précis avec un sélecteur CSS.",
+        schema: z.object({
+            touche: z.string().describe("Touche : 'Enter', 'Tab', 'Escape', 'ArrowDown', 'Space', etc."),
+            selecteur: opt(z.string()).describe("Sélecteur CSS optionnel de l'élément ciblé"),
+        }),
+    }
+);
+
+export const selectionnerOptionE2B = tool(
+    async ({ selecteur, valeur, label }) => {
+        try { return await e2bSandbox.selectionnerOption({ selecteur, valeur: valeur ?? undefined, label: label ?? undefined }); }
+        catch (e) { return `Erreur sélection (E2B) : ${(e as Error).message}`; }
+    },
+    {
+        name: "selectionner_option_e2b",
+        description: "Sélectionne une option dans un menu déroulant <select> dans la sandbox E2B. Utilise 'valeur' (attribut value) ou 'label' (texte visible).",
+        schema: z.object({
+            selecteur: z.string().describe("Sélecteur CSS du <select>"),
+            valeur: opt(z.string()).describe("Valeur de l'option (attribut value)"),
+            label: opt(z.string()).describe("Texte visible de l'option"),
+        }),
+    }
+);
+
+export const evaluerJSE2B = tool(
+    async ({ script }) => {
+        try { return await e2bSandbox.evaluerJS(script); }
+        catch (e) { return `Erreur JS (E2B) : ${(e as Error).message}`; }
+    },
+    {
+        name: "evaluer_js_e2b",
+        description: "Exécute du JavaScript directement sur la page dans la sandbox E2B. Utile pour lire des données dynamiques, forcer des valeurs de champs, ou interagir avec des éléments inaccessibles autrement.",
+        schema: z.object({
+            script: z.string().describe("Code JavaScript à exécuter sur la page (ex: 'document.title' ou 'document.querySelector(\"#email\").value')"),
+        }),
+    }
+);
+
 export const e2bTools = [
     demarrerSandbox,
     allerversE2B,
@@ -152,4 +197,7 @@ export const e2bTools = [
     attendreE2B,
     cocherCaseE2B,
     scrollerE2B,
+    appuyerToucheE2B,
+    selectionnerOptionE2B,
+    evaluerJSE2B,
 ];

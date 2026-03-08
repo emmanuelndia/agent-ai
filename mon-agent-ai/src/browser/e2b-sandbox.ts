@@ -175,17 +175,31 @@ await read()
     const err = await this.assureSandboxVivant();
     if (err) return err;
     try {
-      const action = options.texte
-        ? `await page.get_by_text("${options.texte}").first.click()`
-        : options.selecteur
-          ? `await page.click("${options.selecteur}")`
-          : null;
-      if (!action) return "❌ Aucun sélecteur ou texte fourni";
+      if (!options.texte && !options.selecteur) return "❌ Aucun sélecteur ou texte fourni";
+
+      let code: string;
+      if (options.texte) {
+        // Clic par texte : essayer get_by_text puis fallback XPath
+        code = `
+    try:
+        await page.get_by_text("${options.texte}").first.click(timeout=5000)
+    except Exception:
+        # Fallback : XPath texte partiel
+        await page.locator(f"text=${options.texte}").first.click(timeout=5000)`;
+      } else {
+        // Clic par sélecteur : attendre visible puis clic, fallback JS click
+        code = `
+    await page.wait_for_selector("${options.selecteur}", state="visible", timeout=5000)
+    try:
+        await page.click("${options.selecteur}", timeout=5000)
+    except Exception:
+        # Fallback : JS click pour éléments bloqués par overlays
+        await page.evaluate("document.querySelector('${options.selecteur}').click()")`;
+      }
 
       const result = await this.sandbox!.runCode(`
 import asyncio
-async def click():
-    ${action}
+async def click():${code}
     print("clicked")
 await click()
 `);
@@ -199,20 +213,30 @@ await click()
     const err = await this.assureSandboxVivant();
     if (err) return err;
     try {
-      const texteEscaped = options.texte.replace(/"/g, '\\"');
-      const action = (options.effacer ?? true)
-        ? `await page.fill("${options.selecteur}", "${texteEscaped}")`
-        : `await page.type("${options.selecteur}", "${texteEscaped}")`;
+      const texteEscaped = options.texte.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+      const sel = options.selecteur;
+      const effacer = options.effacer ?? true;
 
       const result = await this.sandbox!.runCode(`
 import asyncio
 async def type_text():
-    ${action}
-    print("typed")
+    # Attendre que l'élément soit visible et interactif
+    await page.wait_for_selector("${sel}", state="visible", timeout=5000)
+    try:
+        # Méthode 1 : fill() — remplace tout le contenu (rapide)
+        ${effacer ? `await page.fill("${sel}", "${texteEscaped}")` : `await page.type("${sel}", "${texteEscaped}")`}
+        print("typed")
+    except Exception as e1:
+        # Méthode 2 : clic + sélection tout + frappe (fallback robuste)
+        await page.click("${sel}")
+        await page.keyboard.press("Control+a")
+        await page.keyboard.type("${texteEscaped}")
+        print("typed_fallback")
 await type_text()
 `);
       if (result.error) return `❌ Saisie : ${result.error.value}\n${result.error.traceback}`;
       this.lastActivity = Date.now();
+      return `✅ Texte "${options.texte}" saisi dans ${options.selecteur}`;
       return `✅ Texte "${options.texte}" saisi dans ${options.selecteur}`;
     } catch (e) { return `❌ Saisie : ${(e as Error).message}`; }
   }
@@ -315,6 +339,85 @@ await close()
       this.sandbox = null;
       this.browserReady = false;
     }
+  }
+
+  // ── Appuyer sur une touche clavier (Enter, Tab, Escape, etc.) ─────────────
+  async appuyerTouche(options: { touche: string; selecteur?: string }): Promise<string> {
+    const err = await this.assureSandboxVivant();
+    if (err) return err;
+    try {
+      const action = options.selecteur
+        ? `await page.press("${options.selecteur}", "${options.touche}")`
+        : `await page.keyboard.press("${options.touche}")`;
+      const result = await this.sandbox!.runCode(`
+import asyncio
+async def press():
+    ${action}
+    print("pressed")
+await press()
+`);
+      if (result.error) return `❌ Touche : ${result.error.value}\n${result.error.traceback}`;
+      this.lastActivity = Date.now();
+      return `✅ Touche "${options.touche}" pressée${options.selecteur ? ` sur ${options.selecteur}` : ''}`;
+    } catch (e) { return `❌ Touche : ${(e as Error).message}`; }
+  }
+
+  // ── Sélectionner une option dans un <select> ──────────────────────────────
+  async selectionnerOption(options: { selecteur: string; valeur?: string; label?: string }): Promise<string> {
+    const err = await this.assureSandboxVivant();
+    if (err) return err;
+    try {
+      const arg = options.valeur
+        ? `value="${options.valeur}"`
+        : `label="${options.label}"`;
+      const result = await this.sandbox!.runCode(`
+import asyncio
+async def select():
+    await page.select_option("${options.selecteur}", ${arg})
+    print("selected")
+await select()
+`);
+      if (result.error) return `❌ Sélection : ${result.error.value}\n${result.error.traceback}`;
+      this.lastActivity = Date.now();
+      return `✅ Option "${options.valeur || options.label}" sélectionnée dans ${options.selecteur}`;
+    } catch (e) { return `❌ Sélection : ${(e as Error).message}`; }
+  }
+
+  // ── Exécuter du JavaScript sur la page ────────────────────────────────────
+  async evaluerJS(script: string): Promise<string> {
+    const err = await this.assureSandboxVivant();
+    if (err) return err;
+    try {
+      const scriptEscaped = script.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
+      const result = await this.sandbox!.runCode(`
+import asyncio
+async def eval_js():
+    result = await page.evaluate("${scriptEscaped}")
+    print(str(result))
+await eval_js()
+`);
+      if (result.error) return `❌ JS : ${result.error.value}\n${result.error.traceback}`;
+      this.lastActivity = Date.now();
+      return `✅ JS exécuté : ${(result.logs?.stdout?.join('') || '').slice(0, 1000)}`;
+    } catch (e) { return `❌ JS : ${(e as Error).message}`; }
+  }
+
+  // ── Survoler un élément (hover) pour déclencher les menus/tooltips ────────
+  async survoler(selecteur: string): Promise<string> {
+    const err = await this.assureSandboxVivant();
+    if (err) return err;
+    try {
+      const result = await this.sandbox!.runCode(`
+import asyncio
+async def hover():
+    await page.hover("${selecteur}")
+    print("hovered")
+await hover()
+`);
+      if (result.error) return `❌ Survol : ${result.error.value}\n${result.error.traceback}`;
+      this.lastActivity = Date.now();
+      return `✅ Survol de ${selecteur}`;
+    } catch (e) { return `❌ Survol : ${(e as Error).message}`; }
   }
 }
 
