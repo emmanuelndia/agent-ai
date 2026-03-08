@@ -121,7 +121,8 @@ class RateLimiter {
     private readonly minDelay: number;
 
     constructor(requestsPerMinute: number) {
-        this.minDelay = (60 / requestsPerMinute) * 1000;
+        // Facteur 1.2 de sécurité pour absorber les jitters réseau
+        this.minDelay = Math.ceil((60 / requestsPerMinute) * 1000 * 1.2);
     }
 
     async wait(): Promise<void> {
@@ -136,7 +137,45 @@ class RateLimiter {
     }
 }
 
-// GESTIONNAIRE MULTI-PROVIDER AVEC FALLBACK AUTOMATIQUE
+// ─────────────────────────────────────────────────────────────────────────────
+// WRAPPER MISTRAL : neutralise les retries internes du SDK @mistralai/mistralai
+//
+// Problème : le SDK retente automatiquement les 429 jusqu'à 5× AVANT de throw,
+// ignorant maxRetries:0 passé à ChatMistralAI. Chaque "tentative" de notre code
+// effectue donc 5 vrais appels HTTP → avec rpm=4 (1 call/15s), le provider est
+// saturé en quelques secondes.
+//
+// Solution : monkey-patch du fetch natif pendant l'appel Mistral pour détecter
+// les 429 et les throw immédiatement SANS retry. Le SDK ne peut pas les intercepter.
+// ─────────────────────────────────────────────────────────────────────────────
+async function invokeSansSdkRetry(llm: any, messages: any[]): Promise<any> {
+    // Sauvegarder le fetch original
+    const originalFetch = globalThis.fetch;
+    let intercepté = false;
+
+    // Remplacer fetch par une version qui throw immédiatement sur 429
+    (globalThis as any).fetch = async (...args: any[]) => {
+        const response = await originalFetch(...args);
+        if (response.status === 429 && !intercepté) {
+            intercepté = true;
+            // Cloner la réponse pour lire le corps tout en préservant la réponse originale
+            const text = await response.clone().text();
+            throw Object.assign(
+                new Error(`Rate limit exceeded (429 intercepté): ${text}`),
+                { status: 429 }
+            );
+        }
+        return response;
+    };
+
+    try {
+        return await llm.invoke(messages);
+    } finally {
+        // Toujours restaurer le fetch original
+        globalThis.fetch = originalFetch;
+    }
+}
+
 
 interface ProviderConfig {
     name: string;
@@ -180,11 +219,12 @@ const PROVIDERS_CHAIN: ProviderConfig[] = [
     },
 
     // ── 2. Mistral small — ILLIMITÉ (1 Md tokens/mois), 4 RPM
-    //       Illimité mais lent → backup direct de Cerebras
+    //       maxRetries=1 : avec le wrapper fetch, 1 tentative = 1 vrai appel.
+    //       Si rate limit → cooldown de 30s minimum (1/rpm * 60 * 2) puis suivant.
     {
         name: "Mistral small",
         rpm: 4,
-        maxRetries: 3,
+        maxRetries: 1,   // 1 seule tentative : si 429 → cooldown puis provider suivant
         factory: (tools) => new ChatMistralAI({
             model: "mistral-small-latest",
             temperature: 0,
@@ -193,11 +233,11 @@ const PROVIDERS_CHAIN: ProviderConfig[] = [
         }).bindTools(tools),
     },
 
-    // ── 3. Groq llama-3.3-70b — 14 400 req/jour, très capable, 25 RPM
+    // ── 3. Groq llama-3.3-70b — 14 400 req/jour, très capable, 30 RPM réels
     {
         name: "Groq llama-3.3-70b",
-        rpm: 25,
-        maxRetries: 3,
+        rpm: 20,   // conservateur : 30 RPM officiel mais on partage avec llama-3.1-8b
+        maxRetries: 2,
         factory: (tools) => new ChatGroq({
             model: "llama-3.3-70b-versatile",
             temperature: 0,
@@ -209,8 +249,8 @@ const PROVIDERS_CHAIN: ProviderConfig[] = [
     // ── 4. Groq llama-3.1-8b — quota SÉPARÉ du 3.3-70b
     {
         name: "Groq llama-3.1-8b",
-        rpm: 25,
-        maxRetries: 3,
+        rpm: 20,
+        maxRetries: 2,
         factory: (tools) => new ChatGroq({
             model: "llama-3.1-8b-instant",
             temperature: 0,
@@ -223,7 +263,7 @@ const PROVIDERS_CHAIN: ProviderConfig[] = [
     //       Quota PRÉCIEUX → réservé en dernier recours
     {
         name: "Gemini 2.0 Flash",
-        rpm: 55,
+        rpm: 15,   // 15 RPM officiels niveau free
         maxRetries: 3,
         factory: (tools) => new ChatGoogleGenerativeAI({
             model: "gemini-2.0-flash",
@@ -251,7 +291,7 @@ const PROVIDERS_CHAIN: ProviderConfig[] = [
     {
         name: "Cohere command-r",
         rpm: 20,
-        maxRetries: 3,
+        maxRetries: 2,
         factory: (tools) => new ChatCohere({
             model: "command-r",
             temperature: 0,
@@ -344,12 +384,17 @@ class MultiProviderLLM {
             const config  = PROVIDERS_CHAIN[i];
             const limiter = this.rateLimiters.get(i)!;
             const llm     = this.getInstance(i);
+            // Mistral SDK ignore maxRetries:0 → utiliser le wrapper fetch-interceptor
+            const isMistral = config.name.toLowerCase().includes("mistral");
 
             for (let attempt = 0; attempt < config.maxRetries; attempt++) {
                 try {
                     await limiter.wait();
                     console.log(`[${config.name}] tentative ${attempt + 1}/${config.maxRetries}`);
-                    const result = await llm.invoke(messages);
+                    // Mistral : intercepter les 429 avant que le SDK ne les retente 5×
+                    const result = isMistral
+                        ? await invokeSansSdkRetry(llm, messages)
+                        : await llm.invoke(messages);
                     // Succès → retirer le cooldown éventuel
                     this.rateLimitedUntil.set(i, 0);
                     return result;
@@ -366,18 +411,22 @@ class MultiProviderLLM {
                             break;
 
                         case "SKIP":
-                            // Erreur de format pour CETTE requête (ex: tool_call sans id, message_order)
-                            // → skip ce provider pour cette requête UNIQUEMENT, pas définitivement
+                            // Erreur de format pour CETTE requête
                             console.warn(`[${config.name}] format incompatible pour cette requête → skip (provider conservé)`);
                             attempt = config.maxRetries;
                             break;
 
                         case "RATE_LIMIT": {
-                            const match   = error?.message?.match(/retry.*?(\d+(?:\.\d+)?)\s*s/i);
-                            const suggest = match ? parseFloat(match[1]) * 1000 : 0;
-                            const waitMs  = Math.max(suggest, Math.pow(2, attempt + 1) * 1000);
-                            console.warn(`Rate limit - attente ${Math.round(waitMs / 1000)}s...`);
-                            // Mémoriser le cooldown pour ne pas réessayer avant ce délai
+                            // Extraire le délai suggéré par l'API (ex: "retry after 30s")
+                            const match    = error?.message?.match(/retry[^0-9]*(\d+(?:\.\d+)?)\s*s/i);
+                            const suggest  = match ? parseFloat(match[1]) * 1000 : 0;
+                            // Cooldown minimum basé sur le rpm du provider :
+                            // Si rpm=4 → 1 call / 15s. Après un 429, attendre au moins 1 fenêtre complète.
+                            const rpmCooldown = Math.ceil((60 / config.rpm) * 1000 * 3); // 3× la fenêtre RPM
+                            // Exponentiel classique mais avec un floor raisonnable
+                            const expBackoff  = Math.pow(2, attempt + 2) * 1000; // 4s, 8s, 16s...
+                            const waitMs      = Math.max(suggest, rpmCooldown, expBackoff);
+                            console.warn(`Rate limit - attente ${Math.round(waitMs / 1000)}s... (rpm=${config.rpm}, suggest=${Math.round(suggest/1000)}s)`);
                             this.rateLimitedUntil.set(i, Date.now() + waitMs);
                             await sleep(waitMs);
                             break;
@@ -1082,4 +1131,4 @@ async function demarrerInterface() {
 
 if (require.main === module) {
     demarrerInterface().catch(err => console.error("Erreur interface console:", err));
-}   
+}

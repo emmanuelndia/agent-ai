@@ -24,12 +24,35 @@ export class E2BSandbox {
     this.keepaliveTimer = setInterval(async () => {
       if (!this.sandbox || !this.browserReady) { this.stopKeepalive(); return; }
       try {
-        await this.sandbox.runCode("print('keepalive')");
-        this.lastActivity = Date.now();
-        console.log("🔁 E2B keepalive OK");
+        // Vérifier kernel ET globals browser/page
+        const result = await this.sandbox.runCode(`
+try:
+    ok = (
+        'browser' in globals() and browser is not None and browser.is_connected() and
+        'page' in globals() and page is not None and not page.is_closed()
+    )
+    print('alive' if ok else 'dead')
+except:
+    print('dead')
+`);
+        const out = result.logs?.stdout?.join('') ?? '';
+        if (out.includes('alive')) {
+          this.lastActivity = Date.now();
+          console.log("🔁 E2B keepalive OK (browser + page vivants)");
+        } else {
+          console.log("⚠️  E2B keepalive : browser/page perdus — réinitialisation silencieuse...");
+          this.stopKeepalive();
+          this.browserReady = false;
+          // Réinit automatique sans bloquer le keepalive
+          this._initialiser().then(err => {
+            if (err) console.error("❌ Réinit keepalive échouée :", err);
+            else console.log("✅ Réinit keepalive réussie");
+          });
+        }
       } catch {
-        console.log("⚠️  E2B keepalive échoué — sandbox probablement expiré");
+        console.log("⚠️  E2B keepalive échoué — sandbox probablement expirée");
         this.stopKeepalive();
+        this.browserReady = false;
       }
     }, this.KEEPALIVE_INTERVAL_MS);
   }
@@ -49,12 +72,24 @@ export class E2BSandbox {
       return await this._initialiser();
     }
 
-    // Ping rapide pour vérifier que le kernel Python est encore vivant
+    // Ping rapide pour vérifier que le kernel Python ET le navigateur sont vivants.
+    // IMPORTANT : vérifier browser et page globaux, pas seulement que le kernel tourne.
+    // Le kernel peut survivre à un crash du browser → print('ping') passerait mais
+    // toutes les actions navigateur échoueraient avec "Target page has been closed".
     try {
-      const ping = await this.sandbox!.runCode("print('ping')");
-      const ok = ping.logs?.stdout?.join('').includes('ping');
-      if (!ok || ping.error) {
-        console.log("🔄 E2B : kernel mort, réinitialisation...");
+      const ping = await this.sandbox!.runCode(`
+try:
+    is_ok = (
+        'browser' in globals() and browser is not None and browser.is_connected() and
+        'page' in globals() and page is not None and not page.is_closed()
+    )
+    print('ping_ok' if is_ok else 'ping_dead')
+except Exception as e:
+    print('ping_dead')
+`);
+      const out = ping.logs?.stdout?.join('') ?? '';
+      if (ping.error || !out.includes('ping_ok')) {
+        console.log(`🔄 E2B : navigateur mort ou globals perdus (${out.trim()}), réinitialisation...`);
         return await this._initialiser();
       }
     } catch (e: any) {
@@ -136,7 +171,21 @@ await setup()
       const result = await this.sandbox!.runCode(`
 import asyncio
 async def go():
-    await page.goto("${url}", wait_until="networkidle")
+    # "domcontentloaded" est fiable et rapide — "networkidle" peut bloquer 30s+
+    # sur les SPAs / pages avec connexions persistantes (websockets, SSE, pub trackers)
+    try:
+        await page.goto("${url}", wait_until="domcontentloaded", timeout=30000)
+    except Exception as e_goto:
+        if "timeout" in str(e_goto).lower():
+            # Si timeout, on est peut-être quand même sur la page → continuer
+            print(f"Warning timeout goto, continuing: {page.url}")
+        else:
+            raise
+    # Attendre que le body soit présent avant de retourner
+    try:
+        await page.wait_for_selector("body", timeout=5000)
+    except:
+        pass
     print(f"Navigated to {page.url}")
 await go()
 `);
