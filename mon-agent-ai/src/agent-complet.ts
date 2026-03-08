@@ -1119,6 +1119,6 @@ async function demarrerInterface() {
     LireQuestion();
 }
 
-if (require.main === module) {
+if (!process.env.SERVER_MODE && require.main === module) {
     demarrerInterface().catch(err => console.error("Erreur interface console:", err));
 }
