@@ -5,6 +5,7 @@ import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 import { ChatOpenAI } from "@langchain/openai";   // ← Cerebras via wrapper OpenAI-compatible
 import { ChatCohere } from "@langchain/cohere";
 import { ChatOllama } from "@langchain/ollama";
+console.log("🟢 ChatOllama =", ChatOllama);
 // ChatCerebras (@langchain/cerebras) SUPPRIMÉ : incompatible avec @langchain/core@0.3.x
 // Cerebras est utilisé via ChatOpenAI avec baseURL custom (zéro conflit de dépendance)
 import { StateGraph, Annotation, END, START } from "@langchain/langgraph";
