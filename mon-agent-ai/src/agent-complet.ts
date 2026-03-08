@@ -1,6 +1,7 @@
 import { ChatGroq } from "@langchain/groq";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
-import { ChatMistralAI } from "@langchain/mistralai";
+// ChatMistralAI supprimé : SDK @mistralai/mistralai ignorait maxRetries:0 et faisait 5 retries cachés.
+// Mistral est maintenant utilisé via ChatOpenAI + baseURL "https://api.mistral.ai/v1" (OpenAI-compatible).
 import { ChatOpenAI } from "@langchain/openai";   // ← Cerebras via wrapper OpenAI-compatible
 import { ChatCohere } from "@langchain/cohere";
 // ChatCerebras (@langchain/cerebras) SUPPRIMÉ : incompatible avec @langchain/core@0.3.x
@@ -137,45 +138,6 @@ class RateLimiter {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// WRAPPER MISTRAL : neutralise les retries internes du SDK @mistralai/mistralai
-//
-// Problème : le SDK retente automatiquement les 429 jusqu'à 5× AVANT de throw,
-// ignorant maxRetries:0 passé à ChatMistralAI. Chaque "tentative" de notre code
-// effectue donc 5 vrais appels HTTP → avec rpm=4 (1 call/15s), le provider est
-// saturé en quelques secondes.
-//
-// Solution : monkey-patch du fetch natif pendant l'appel Mistral pour détecter
-// les 429 et les throw immédiatement SANS retry. Le SDK ne peut pas les intercepter.
-// ─────────────────────────────────────────────────────────────────────────────
-async function invokeSansSdkRetry(llm: any, messages: any[]): Promise<any> {
-    // Sauvegarder le fetch original
-    const originalFetch = globalThis.fetch;
-    let intercepté = false;
-
-    // Remplacer fetch par une version qui throw immédiatement sur 429
-    (globalThis as any).fetch = async (...args: any[]) => {
-        const response = await originalFetch(...args);
-        if (response.status === 429 && !intercepté) {
-            intercepté = true;
-            // Cloner la réponse pour lire le corps tout en préservant la réponse originale
-            const text = await response.clone().text();
-            throw Object.assign(
-                new Error(`Rate limit exceeded (429 intercepté): ${text}`),
-                { status: 429 }
-            );
-        }
-        return response;
-    };
-
-    try {
-        return await llm.invoke(messages);
-    } finally {
-        // Toujours restaurer le fetch original
-        globalThis.fetch = originalFetch;
-    }
-}
-
 
 interface ProviderConfig {
     name: string;
@@ -192,25 +154,25 @@ interface ProviderConfig {
  * ┌──────────────────────────────┬──────┬──────────────┬─────────────────────┐
  * │ Provider / Modèle            │ RPM  │ Req/jour     │ Notes               │
  * ├──────────────────────────────┼──────┼──────────────┼─────────────────────┤
- * │ Cerebras llama-3.3-70b       │  28  │  ILLIMITÉ    │ Principal           │
- * │ Mistral small                │   4  │  ILLIMITÉ    │ 1 Md tokens/mois    │
- * │ Groq llama-3.3-70b           │  25  │   14 400     │ Très capable        │
- * │ Groq llama-3.1-8b            │  25  │   14 400 *   │ Quota séparé        │
- * │ Gemini 2.0 Flash             │  55  │    1 500     │ Précieux, last res. │
+ * │ Cerebras gpt-oss-120b        │  30  │   14 400     │ Principal — 120B    │
+ * │ Cerebras llama3.1-8b         │  30  │   14 400 *   │ Quota séparé        │
+ * │ Mistral small                │   4  │  ILLIMITÉ    │ Via OpenAI endpoint │
+ * │ Groq llama-3.3-70b           │  20  │   14 400     │ Fallback capable    │
+ * │ Groq llama-3.1-8b            │  20  │   14 400 *   │ Quota séparé        │
+ * │ Gemini 2.0 Flash             │  15  │    1 500     │ Précieux, last res. │
  * │ Gemini 2.5 Flash             │   9  │      500 *   │ Quota séparé        │
  * │ Cohere command-r             │  20  │    1 000     │ Skip auto (schema)  │
  * └──────────────────────────────┴──────┴──────────────┴─────────────────────┘
  */
 const PROVIDERS_CHAIN: ProviderConfig[] = [
 
-    // ── 1. Cerebras llama-3.3-70b — ILLIMITÉ, très capable, 28 RPM
-    //       Via wrapper OpenAI-compatible (zéro conflit de dépendance)
+    // ── 1. Cerebras gpt-oss-120b — ILLIMITÉ, 30 RPM, 120B params
     {
-        name: "Cerebras llama-3.3-70b",
-        rpm: 28,
+        name: "Cerebras gpt-oss-120b",
+        rpm: 28,  // légèrement sous les 30 officiels pour absorber les jitters
         maxRetries: 3,
         factory: (tools) => new ChatOpenAI({
-            model: "llama3.3-70b",
+            model: "gpt-oss-120b",
             temperature: 0,
             apiKey: process.env.CEREBRAS_API_KEY,
             configuration: { baseURL: "https://api.cerebras.ai/v1" },
@@ -218,19 +180,35 @@ const PROVIDERS_CHAIN: ProviderConfig[] = [
         }).bindTools(tools, { strict: false }),
     },
 
-    // ── 2. Mistral small — ILLIMITÉ (1 Md tokens/mois), 4 RPM
-    //       maxRetries=1 : avec le wrapper fetch, 1 tentative = 1 vrai appel.
-    //       Si rate limit → cooldown de 30s minimum (1/rpm * 60 * 2) puis suivant.
+    // ── 2. Cerebras llama3.1-8b — quota SÉPARÉ du 120b, très rapide
+    {
+        name: "Cerebras llama3.1-8b",
+        rpm: 28,
+        maxRetries: 3,
+        factory: (tools) => new ChatOpenAI({
+            model: "llama3.1-8b",
+            temperature: 0,
+            apiKey: process.env.CEREBRAS_API_KEY,
+            configuration: { baseURL: "https://api.cerebras.ai/v1" },
+            maxRetries: 0,
+        }).bindTools(tools, { strict: false }),
+    },
+
+    // ── 3. Mistral small — ILLIMITÉ (1 Md tokens/mois), 4 RPM
+    //       VIA endpoint OpenAI-compatible (pas le SDK @mistralai/mistralai)
+    //       Le SDK natif ignorait maxRetries:0 et faisait 5 retries HTTP cachés.
+    //       ChatOpenAI + baseURL custom = contrôle total, maxRetries:0 respecté.
     {
         name: "Mistral small",
         rpm: 4,
-        maxRetries: 1,   // 1 seule tentative : si 429 → cooldown puis provider suivant
-        factory: (tools) => new ChatMistralAI({
+        maxRetries: 1,
+        factory: (tools) => new ChatOpenAI({
             model: "mistral-small-latest",
             temperature: 0,
             apiKey: process.env.MISTRAL_API_KEY,
-            maxRetries: 0,
-        }).bindTools(tools),
+            configuration: { baseURL: "https://api.mistral.ai/v1" },
+            maxRetries: 0,  // respecté car ChatOpenAI, pas @mistralai/mistralai
+        }).bindTools(tools, { strict: false }),
     },
 
     // ── 3. Groq llama-3.3-70b — 14 400 req/jour, très capable, 30 RPM réels
@@ -384,17 +362,12 @@ class MultiProviderLLM {
             const config  = PROVIDERS_CHAIN[i];
             const limiter = this.rateLimiters.get(i)!;
             const llm     = this.getInstance(i);
-            // Mistral SDK ignore maxRetries:0 → utiliser le wrapper fetch-interceptor
-            const isMistral = config.name.toLowerCase().includes("mistral");
 
             for (let attempt = 0; attempt < config.maxRetries; attempt++) {
                 try {
                     await limiter.wait();
                     console.log(`[${config.name}] tentative ${attempt + 1}/${config.maxRetries}`);
-                    // Mistral : intercepter les 429 avant que le SDK ne les retente 5×
-                    const result = isMistral
-                        ? await invokeSansSdkRetry(llm, messages)
-                        : await llm.invoke(messages);
+                    const result = await llm.invoke(messages);
                     // Succès → retirer le cooldown éventuel
                     this.rateLimitedUntil.set(i, 0);
                     return result;
@@ -404,8 +377,8 @@ class MultiProviderLLM {
 
                     switch (kind) {
                         case "QUOTA_EXHAUSTED":
-                            // Quota journalier épuisé → marquer définitivement et passer au suivant
                             console.warn(`Quota epuise sur [${config.name}] → skip définitif pour cette session`);
+                            console.warn(`  Détail erreur : status=${error?.status ?? '?'} | ${String(error?.message).slice(0, 200)}`);
                             this.quotaEpuise.set(i, true);
                             attempt = config.maxRetries;
                             break;
