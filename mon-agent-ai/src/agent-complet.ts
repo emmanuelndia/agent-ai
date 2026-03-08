@@ -993,7 +993,8 @@ const graphe = new StateGraph(EtatAgent)
     .addEdge(START, "llm")
     .addConditionalEdges("llm", decider)
     .addEdge("tools", "llm")
-    .compile();
+    .compile()
+    .withConfig({ recursionLimit: 100 });
 
 // API PUBLIQUE
 
@@ -1018,8 +1019,7 @@ export async function traiterMessage(messageUtilisateur: string): Promise<AgentR
         await contextManager.addMessage(new HumanMessage(messageUtilisateur)); // contexte sans injection
 
         const resultat = await graphe.invoke(
-            { messages: [messageEntrant] },
-            { recursionLimit: 100 }
+            { messages: [messageEntrant] }
         );
 
         let screenshotData: string | undefined;
