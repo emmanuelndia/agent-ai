@@ -990,19 +990,37 @@ async function noeudLLM(etat: typeof EtatAgent.State) {
                     return { messages: [normaliserToolCallIds(reponseNucleaire)] };
                 } catch (e2: any) {
                     console.error("Fallback nucléaire échoué:", e2?.message);
-                    // Dernier recours : message d'erreur explicite à l'utilisateur
-                    if (e2?.message === "ALL_RATE_LIMITED") {
-                        return { messages: [new AIMessage(
-                            "⏳ Tous les providers LLM sont temporairement saturés (rate limits). " +
-                            "Attends 1 à 2 minutes puis réessaie."
-                        )] };
+                    // Tous les providers sont saturés ou le contexte est toujours cassé
+                    // → attendre 30s puis retenter UNE dernière fois avant de rendre la main
+                    if (
+                        e2?.message === "ALL_RATE_LIMITED" ||
+                        e2?.message === "CONTEXT_INCOMPATIBLE"
+                    ) {
+                        console.warn("⏳ Attente 30s avant dernier essai...");
+                        await sleep(30000);
+                        multiLLM.resetRateLimits();
+                        try {
+                            const reponseFinale = await multiLLM.invoke([
+                                new HumanMessage(
+                                    "Tu es un agent IA autonome. Réponds en français. " +
+                                    "Message : " + String(dernierHuman.content)
+                                )
+                            ]);
+                            console.log("Réponse dernier essai reçue.");
+                            return { messages: [normaliserToolCallIds(reponseFinale)] };
+                        } catch {
+                            return { messages: [new AIMessage(
+                                "⏳ Tous les providers LLM sont temporairement saturés. " +
+                                "Attends 1 à 2 minutes puis réessaie."
+                            )] };
+                        }
                     }
                 }
             }
         }
 
         const isQuotaEpuise = error?.message?.includes("Tous les providers");
-        const isRateLimit   = error?.message === "ALL_RATE_LIMITED";
+        const isRateLimit   = error?.message === "ALL_RATE_LIMITED" || error?.message === "CONTEXT_INCOMPATIBLE";
         const messageErreur = isQuotaEpuise
             ? "ERREUR QUOTA : Tous les providers LLM sont epuises. Attendre demain."
             : isRateLimit
