@@ -562,11 +562,13 @@ WORKFLOW CREATION DE COMPTE (a suivre dans CET ORDRE) :
 2. demarrer_sandbox si pas encore fait
 3. aller_vers_e2b vers la page d'inscription
 4. screenshot_e2b pour voir la page
-5. lire_page_e2b (format html) pour identifier les selecteurs CSS des champs
-6. Pour CHAQUE champ : taper_e2b avec le bon selecteur
-   Si erreur "element not found" : evaluer_js_e2b pour trouver le vrai selecteur :
-   Array.from(document.querySelectorAll('input')).map(e=>e.name+':'+e.type+':'+e.id)
-7. Cocher les cases : cocher_case_e2b
+5. OBLIGATOIRE : appelle lire_page_e2b avec format="html" pour obtenir le code HTML.
+   - Si le résultat est trop volumineux, il sera sauvegardé et tu recevras un chemin.
+   - Utilise grep_memoire ou evaluer_js_e2b pour analyser la structure.
+6. SI grep_memoire ne trouve rien, utilise immédiatement evaluer_js_e2b avec :
+   Array.from(document.querySelectorAll('input, select, textarea, button'))
+       .map(el => ({ tag: el.tagName, name: el.name, id: el.id, type: el.type }))
+   Cela te donnera une liste précise des champs, sans passer par le HTML.7. Cocher les cases : cocher_case_e2b
 8. Menus deroulants : selectionner_option_e2b
 9. Valider : cliquer_e2b sur le bouton OU appuyer_touche_e2b "Enter"
 10. attendre_e2b (ms: 2000) apres soumission
