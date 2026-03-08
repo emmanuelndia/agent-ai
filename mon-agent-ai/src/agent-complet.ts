@@ -1,8 +1,12 @@
 import { ChatGroq } from "@langchain/groq";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
+// ChatMistralAI supprimé : SDK @mistralai/mistralai ignorait maxRetries:0 et faisait 5 retries cachés.
+// Mistral est maintenant utilisé via ChatOpenAI + baseURL "https://api.mistral.ai/v1" (OpenAI-compatible).
 import { ChatOpenAI } from "@langchain/openai";   // ← Cerebras via wrapper OpenAI-compatible
 import { ChatCohere } from "@langchain/cohere";
-import { ChatOllama } from "@langchain/ollama";
+
+// ChatCerebras (@langchain/cerebras) SUPPRIMÉ : incompatible avec @langchain/core@0.3.x
+// Cerebras est utilisé via ChatOpenAI avec baseURL custom (zéro conflit de dépendance)
 import { StateGraph, Annotation, END, START } from "@langchain/langgraph";
 import { ToolNode } from "@langchain/langgraph/prebuilt";
 import { HumanMessage, AIMessage, BaseMessage, ToolMessage } from "@langchain/core/messages";
@@ -163,18 +167,6 @@ interface ProviderConfig {
  * └──────────────────────────────┴──────┴──────────────┴─────────────────────┘
  */
 const PROVIDERS_CHAIN: ProviderConfig[] = [
-
-    // ── 1. Ollama (auto-hébergé sur Railway) ──────────────────────────
-    {
-        name: "Ollama Llama3.2 (Railway)",
-        rpm: 100, // valeur haute, pas de limite réelle
-        maxRetries: 2,
-        factory: (tools) => new ChatOllama({
-        baseUrl: process.env.OLLAMA_PUBLIC_URL,   // l'URL que vous avez notée
-        model: "llama3.2:3b",                     // le modèle que vous avez téléchargé
-        temperature: 0,
-        }).bindTools(tools),
-    },
 
     // ── 1. Cerebras gpt-oss-120b — ILLIMITÉ, 30 RPM, 120B params
     {
