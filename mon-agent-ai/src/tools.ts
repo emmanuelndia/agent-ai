@@ -1,26 +1,23 @@
 import { tool } from "@langchain/core/tools";
-import { date, z } from "zod";
-
-const opt = <T extends z.ZodTypeAny>(s: T) => s.optional().nullable();
+import { z } from "zod";
 import * as fs from "fs";
 import * as path from "path";
 
-// TOOL : CALCULATRICE //
+// TOOL : CALCULATRICE
 export const calculer = tool(
-    async ({ expression} : { expression: string}) => {
+    async ({ expression }: { expression: string }) => {
         try {
-            // Sécurité : n'évalue que des expressions mathématiques
-            if(/[a-zA-Z]/.test(expression.replace(/Math\./g, ""))) {
+            if (/[a-zA-Z]/.test(expression.replace(/Math\./g, ""))) {
                 return "Erreur : Expression invalide (Lettres non autorisées)";
             }
             const resultat = Function(`"use strict"; return (${expression})`)();
-            return `Erreur : ${expression} = ${resultat}`;
+            return `${expression} = ${resultat}`;
         } catch (e) {
             return `Erreur de calcul : ${(e as Error).message}`;
         }
     },
     {
-        name: "calculer", 
+        name: "calculer",
         description: "Evalue une expression mathématique. Exemple : '2 + 2', '10 * 5', '2 ** 10'",
         schema: z.object({
             expression: z.string().describe("Expression mathématique JavaScript valide"),
@@ -28,16 +25,16 @@ export const calculer = tool(
     }
 );
 
-// TOOL : LECTURE D'UN FICHIER 
+// TOOL : LECTURE D'UN FICHIER
 export const lireFichier = tool(
-    async ({chemin}: {chemin: string}) => {
+    async ({ chemin }: { chemin: string }) => {
         try {
             const cheminAbsolu = path.resolve(chemin);
-            if(!fs.existsSync(cheminAbsolu)) {
+            if (!fs.existsSync(cheminAbsolu)) {
                 return `Fichier introuvable : ${cheminAbsolu}`;
             }
             const contenu = fs.readFileSync(cheminAbsolu, "utf-8");
-            if(contenu.length > 3000) {
+            if (contenu.length > 3000) {
                 return contenu.slice(0, 3000) + "\n...[fichier tronqué à 3000 caractères]";
             }
             return contenu;
@@ -56,20 +53,19 @@ export const lireFichier = tool(
 
 // TOOL : ECRITURE DANS UN FICHIER
 export const ecrireFichier = tool(
-    async({ chemin, contenu, mode}) => {
+    async ({ chemin, contenu, mode }) => {
         try {
             const cheminAbsolu = path.resolve(chemin);
             const dossier = path.dirname(cheminAbsolu);
-            fs.mkdirSync(dossier, { recursive: true});
+            fs.mkdirSync(dossier, { recursive: true });
 
-            if(mode === "append") {
+            if (mode === "append") {
                 fs.appendFileSync(cheminAbsolu, contenu + "\n");
                 return `Contenu ajouté à : ${cheminAbsolu}`;
             } else {
                 fs.writeFileSync(cheminAbsolu, contenu, "utf-8");
                 return `Fichier crée/écrasé dans : ${cheminAbsolu}`;
             }
-
         } catch (e) {
             return `Erreur écriture : ${(e as Error).message}`;
         }
@@ -80,23 +76,21 @@ export const ecrireFichier = tool(
         schema: z.object({
             chemin: z.string().describe("Chemin du fichier à créer/modifier"),
             contenu: z.string().describe("Contenu à écrire"),
-            mode: opt(z.enum(["write", "append"]))
-                .default("write")
+            mode: z.enum(["write", "append"]).optional().default("write")
                 .describe("'write' = écrase, 'append' = ajoute à la fin"),
         }),
     }
 );
 
-
 // TOOL : LISTER LES FICHIERS D'UN DOSSIER
 export const listerFichiers = tool(
-    async ({dossier}) => {
+    async ({ dossier }) => {
         try {
             const cheminAbsolu = path.resolve(dossier || ".");
-            if(!fs.existsSync(cheminAbsolu)) {
+            if (!fs.existsSync(cheminAbsolu)) {
                 return `Dossier introuvable : ${cheminAbsolu}`;
             }
-            const entrées = fs.readdirSync(cheminAbsolu, {withFileTypes: true});
+            const entrées = fs.readdirSync(cheminAbsolu, { withFileTypes: true });
             const liste = entrées.map((e) => {
                 const type = e.isDirectory() ? "📁 Dossier" : "📄 Fichier";
                 const stats = fs.statSync(path.join(cheminAbsolu, e.name));
@@ -110,17 +104,16 @@ export const listerFichiers = tool(
     },
     {
         name: "lister_fichiers",
-        description: "Liste les fichiers et dossiers dans le répertoire. Utilise './screenshots' pour le dossier screenshots.",
+        description: "Liste les fichiers et dossiers dans le répertoire.",
         schema: z.object({
-            dossier: opt(z.string()).default(".").describe("Chemin du dossier à lister (ex: './screenshots')"),
+            dossier: z.string().optional().default(".").describe("Chemin du dossier à lister (ex: './screenshots')"),
         }),
     }
 );
 
-
 // TOOL : OBTENIR LA DATE/HEURE ACTUELLE
 export const obtenirDate = tool(
-    async() => {
+    async () => {
         const maintenant = new Date();
         return JSON.stringify({
             date: maintenant.toLocaleDateString("fr-FR"),
@@ -132,9 +125,9 @@ export const obtenirDate = tool(
     {
         name: "obtenir_date",
         description: "Retourne la date et l'heure actuelles",
-        schema: z.object({}).nullable().optional(),
+        schema: z.object({}),
     }
 );
 
-// export groupé 
+// export groupé
 export const outilsDeBase = [calculer, lireFichier, ecrireFichier, listerFichiers, obtenirDate];

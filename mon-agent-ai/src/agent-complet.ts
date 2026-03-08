@@ -90,6 +90,17 @@ function classifierErreur(error: any): ErrorKind {
         return "QUOTA_EXHAUSTED";
     }
 
+    // Erreurs d'authentification → quota épuisé (clé invalide/absente pour cette session)
+    if (
+        status === 401 ||
+        msg.includes("invalid api key") ||
+        msg.includes("authentication") ||
+        msg.includes("api key") ||
+        msg.includes("unauthorized")
+    ) {
+        return "QUOTA_EXHAUSTED";
+    }
+
     // Mistral / OpenAI : erreurs de FORMAT de message → SKIP (provider réutilisable)
     if (
         msg.includes("tool call id has to be defined") ||
@@ -102,7 +113,13 @@ function classifierErreur(error: any): ErrorKind {
         msg.includes("not the same number of function calls") ||
         // Mistral rejette un AIMessage avec content="" ET sans tool_calls
         // Se produit quand un provider renvoie une réponse vide et qu'on la passe en contexte
-        msg.includes("assistant message must have either content or tool_calls")
+        msg.includes("assistant message must have either content or tool_calls") ||
+        // Cohere : null dans les parameters (champs optional/nullable du schema Zod)
+        msg.includes("expected object. received null") ||
+        msg.includes("toolresults") ||
+        // Groq / OpenAI : message de rôle invalide dans le contexte
+        msg.includes("invalid role") ||
+        msg.includes("last message must be")
     ) {
         return "SKIP";
     }
@@ -438,6 +455,20 @@ class MultiProviderLLM {
                 "Reessaie demain ou active la facturation sur une cle API."
             );
         }
+
+        // Distinguer : tous rate-limités (contexte peut être valide) vs contexte cassé (SKIP)
+        // Si des providers sont encore en cooldown → c'est un problème de rate limit, pas de contexte
+        const nowCheck = Date.now();
+        let nbRateLimites = 0;
+        this.rateLimitedUntil.forEach((until, i) => {
+            if (!this.quotaEpuise.get(i) && until > nowCheck) nbRateLimites++;
+        });
+        if (nbRateLimites > 0) {
+            // Le contexte est peut-être bon mais tous les providers dispo sont en cooldown
+            console.warn(`⚠️  Tous les providers non-épuisés sont en rate-limit. Lancer resetRateLimits() pour débloquer.`);
+            throw new Error("ALL_RATE_LIMITED");
+        }
+
         // Certains ont SKIPpé → contexte cassé mais providers disponibles
         throw new Error("CONTEXT_INCOMPATIBLE");
     }
@@ -931,14 +962,24 @@ async function noeudLLM(etat: typeof EtatAgent.State) {
     } catch (error: any) {
         console.error("Erreur definitive noeudLLM:", error?.message);
 
-        // Contexte trop cassé (tous les providers ont SKIPpé) → fallback nucléaire
-        // On réessaie avec uniquement le dernier message humain, contexte vide
-        if (error?.message === "CONTEXT_INCOMPATIBLE") {
-            console.warn("⚠️  FALLBACK NUCLÉAIRE : clearContext + relance message brut");
+        // Contexte cassé (SKIP de tous les providers) OU tous rate-limités temporairement
+        // → fallback nucléaire : clearContext + reset rate limits + relance message brut
+        const estRecuperable =
+            error?.message === "CONTEXT_INCOMPATIBLE" ||
+            error?.message === "ALL_RATE_LIMITED";
+
+        if (estRecuperable) {
+            const raisonFallback = error?.message === "ALL_RATE_LIMITED"
+                ? "Tous les providers en rate-limit → reset cooldowns"
+                : "Contexte incompatible → reset complet";
+            console.warn(`⚠️  FALLBACK NUCLÉAIRE : ${raisonFallback}`);
+
             const dernierHuman = etat.messages.filter(m => m instanceof HumanMessage).at(-1);
             if (dernierHuman) {
                 try {
-                    await contextManager.clearContext(); // Vider l'historique cassé
+                    await contextManager.clearContext();   // Vider l'historique cassé
+                    multiLLM.resetRateLimits();            // ← CRITIQUE : débloquer les cooldowns
+                    console.warn("🔄 Rate limits réinitialisés, relance avec message brut...");
                     const reponseNucleaire = await multiLLM.invoke([
                         new HumanMessage(
                             "Tu es un agent IA autonome. Réponds en français. " +
@@ -949,13 +990,23 @@ async function noeudLLM(etat: typeof EtatAgent.State) {
                     return { messages: [normaliserToolCallIds(reponseNucleaire)] };
                 } catch (e2: any) {
                     console.error("Fallback nucléaire échoué:", e2?.message);
+                    // Dernier recours : message d'erreur explicite à l'utilisateur
+                    if (e2?.message === "ALL_RATE_LIMITED") {
+                        return { messages: [new AIMessage(
+                            "⏳ Tous les providers LLM sont temporairement saturés (rate limits). " +
+                            "Attends 1 à 2 minutes puis réessaie."
+                        )] };
+                    }
                 }
             }
         }
 
         const isQuotaEpuise = error?.message?.includes("Tous les providers");
+        const isRateLimit   = error?.message === "ALL_RATE_LIMITED";
         const messageErreur = isQuotaEpuise
             ? "ERREUR QUOTA : Tous les providers LLM sont epuises. Attendre demain."
+            : isRateLimit
+            ? "⏳ Tous les providers LLM sont temporairement saturés. Attends 1 à 2 minutes puis réessaie."
             : `ERREUR TECHNIQUE [${error?.constructor?.name ?? "Error"}]: ${error?.message ?? "inconnue"}\n` +
               `Stack: ${(error?.stack ?? "").split("\n").slice(0, 3).join(" | ")}`;
         return { messages: [new AIMessage(messageErreur)] };

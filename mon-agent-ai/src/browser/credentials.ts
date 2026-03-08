@@ -4,7 +4,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
 
-const opt = <T extends z.ZodTypeAny>(s: T) => s.optional().nullable();
+// opt removed
 
 // TYPES
 interface Credential {
@@ -139,8 +139,8 @@ export const sauvegarderCredential = tool(
             url: z.string().describe("URL de la page de connexion"),
             email: z.string().describe("Email ou nom d'utilisateur"),
             motDePasse: z.string().describe("Mot de passe utilisé"),
-            nom: opt(z.string()).describe("Nom affiché / pseudo sur le site"),
-            notes: opt(z.string()).describe("Notes additionnelles"),
+            nom: z.string().optional().describe("Nom affiché / pseudo sur le site"),
+            notes: z.string().optional().describe("Notes additionnelles"),
         }),    
     }
 );
@@ -164,7 +164,7 @@ export const lireCredential = tool(
         description: "Récupère les identifiants suavegardés pour un site",
         schema: z.object({
             site: z.string().describe("Nom ou URL du site"),
-            email: opt(z.string()).describe("Email spécifique si plusieurs comptes"),
+            email: z.string().optional().describe("Email spécifique si plusieurs comptes"),
         }),
     }
 );
@@ -181,7 +181,7 @@ export const listerCredentials = tool(
     {
         name: "lister_credentials",
         description: "Liste tous les comptes et identifiants sauvegardés.",
-        schema: z.object({}).nullable().optional(),
+        schema: z.object({}),
     }
 );
 
@@ -195,7 +195,7 @@ export const generateMotDePasse = tool(
         description:
             "Génère un mot de passe fort et aléatoire. Génère toujours un MDP avant de créer un compte.",
         schema: z.object({
-            longueur: opt(z.number().int().min(8).max(64)).default(16),
+            longueur: z.number().int().min(8).max(64).optional().default(16),
         }),
     }
 );

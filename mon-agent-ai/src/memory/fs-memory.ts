@@ -30,7 +30,7 @@ import { tool }  from "@langchain/core/tools";
 import { z }     from "zod";
 
 // Helper : optional + nullable — requis par OpenAI structured outputs
-const opt = <T extends z.ZodTypeAny>(s: T) => s.optional().nullable();
+// opt supprimé — utiliser .optional().default() à la place
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CONFIGURATION
@@ -178,8 +178,8 @@ export const grepMemoire = tool(
         schema: z.object({
             fichier    : z.string().describe("Chemin absolu ou relatif du fichier à fouiller"),
             pattern    : z.string().describe("Texte ou regex à rechercher (ex: 'email', 'href=', 'Erreur')"),
-            maxLignes  : opt(z.number()).default(30).describe("Nombre max de lignes à retourner (défaut: 30)"),
-            ignoreCase : opt(z.boolean()).default(true).describe("Ignorer la casse (défaut: true)"),
+            maxLignes  : z.number().optional().default(30).describe("Nombre max de lignes à retourner (défaut: 30)"),
+            ignoreCase : z.boolean().optional().default(true).describe("Ignorer la casse (défaut: true)"),
         }),
     }
 );
@@ -222,8 +222,8 @@ export const lireLignes = tool(
             "sans charger tout son contenu en mémoire.",
         schema: z.object({
             fichier : z.string().describe("Chemin du fichier"),
-            debut   : opt(z.number()).describe("Numéro de la première ligne (commence à 1)"),
-            fin     : opt(z.number()).describe("Numéro de la dernière ligne"),
+            debut   : z.number().optional().describe("Numéro de la première ligne (commence à 1)"),
+            fin     : z.number().optional().describe("Numéro de la dernière ligne"),
         }),
     }
 );
@@ -278,8 +278,8 @@ export const rechercherGlob = tool(
             "'*navigation*' trouve les fichiers de navigation. " +
             "Dossiers disponibles : agent-memory/tool-results, agent-memory/plans, agent-memory/discoveries",
         schema: z.object({
-            dossier : opt(z.string()).describe(`Dossier à lister (défaut: ${MEMORY_DIR})`),
-            pattern : opt(z.string()).describe("Filtre glob (ex: '*.txt', '*screenshot*', '2024*')"),
+            dossier : z.string().optional().describe(`Dossier à lister (défaut: ${MEMORY_DIR})`),
+            pattern : z.string().optional().describe("Filtre glob (ex: '*.txt', '*screenshot*', '2024*')"),
         }),
     }
 );
@@ -316,7 +316,7 @@ export const ecrireDecouverte = tool(
         schema: z.object({
             titre   : z.string().describe("Titre court de la découverte"),
             contenu : z.string().describe("Contenu détaillé à sauvegarder"),
-            tags    : z.array(z.string()).optional().nullable().describe("Tags pour faciliter la recherche (ex: ['formulaire', 'github'])"),
+            tags    : z.array(z.string()).optional().default([]).describe("Tags pour faciliter la recherche (ex: ['formulaire', 'github'])"),
         }),
     }
 );
@@ -355,7 +355,7 @@ export const ecrirePlan = tool(
         schema: z.object({
             tache    : z.string().describe("Description de la tâche principale"),
             etapes   : z.array(z.string()).describe("Liste ordonnée des étapes à suivre"),
-            contexte : opt(z.string()).describe("Informations contextuelles utiles"),
+            contexte : z.string().optional().describe("Informations contextuelles utiles"),
         }),
     }
 );
@@ -386,7 +386,7 @@ export const apprendreInstruction = tool(
             "Les instructions sont persistées et rechargées à chaque démarrage.",
         schema: z.object({
             instruction : z.string().describe("L'instruction à mémoriser"),
-            categorie   : opt(z.string()).describe("Catégorie (ex: 'Navigation', 'Formulaires', 'Sécurité')"),
+            categorie   : z.string().optional().describe("Catégorie (ex: 'Navigation', 'Formulaires', 'Sécurité')"),
         }),
     }
 );
@@ -415,7 +415,7 @@ export const lireInstructions = tool(
         description:
             "Lit les instructions et conseils mémorisés lors des sessions précédentes. " +
             "À appeler en début de session longue ou après un 'reset'.",
-        schema: z.object({}).nullish(),
+        schema: z.object({}),
     }
 );
 
@@ -457,7 +457,7 @@ export const resumeSession = tool(
             "Affiche un résumé de tous les fichiers créés pendant la session " +
             "(résultats d'outils déchargés, plans, découvertes). " +
             "Utile pour reprendre le fil d'une longue tâche.",
-        schema: z.object({}).nullish(),
+        schema: z.object({}),
     }
 );
 
@@ -510,7 +510,7 @@ export const mettreAJourTodo = tool(
             etapes: z.array(z.object({
                 texte: z.string().describe("Description de l'étape"),
                 fait : z.boolean().describe("true si l'étape est terminée"),
-                note : opt(z.string()).describe("Note ou erreur rencontrée sur cette étape"),
+                note : z.string().optional().describe("Note ou erreur rencontrée sur cette étape"),
             })).describe("Liste complète des étapes (faites ET à faire)"),
         }),
     }
@@ -532,7 +532,7 @@ export const lireTodo = tool(
         description:
             "Lit la todo-list de la tâche en cours. " +
             "Utilise ce tool pour retrouver le plan si tu perds le fil.",
-        schema: z.object({}).nullish(),
+        schema: z.object({}),
     }
 );
 
