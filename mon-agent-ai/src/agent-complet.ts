@@ -1,11 +1,8 @@
 import { ChatGroq } from "@langchain/groq";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
-// ChatMistralAI supprimé : SDK @mistralai/mistralai ignorait maxRetries:0 et faisait 5 retries cachés.
-// Mistral est maintenant utilisé via ChatOpenAI + baseURL "https://api.mistral.ai/v1" (OpenAI-compatible).
 import { ChatOpenAI } from "@langchain/openai";   // ← Cerebras via wrapper OpenAI-compatible
 import { ChatCohere } from "@langchain/cohere";
-// ChatCerebras (@langchain/cerebras) SUPPRIMÉ : incompatible avec @langchain/core@0.3.x
-// Cerebras est utilisé via ChatOpenAI avec baseURL custom (zéro conflit de dépendance)
+import { ChatOllama } from "@langchain/ollama";
 import { StateGraph, Annotation, END, START } from "@langchain/langgraph";
 import { ToolNode } from "@langchain/langgraph/prebuilt";
 import { HumanMessage, AIMessage, BaseMessage, ToolMessage } from "@langchain/core/messages";
@@ -127,6 +124,7 @@ class RateLimiter {
     }
 
     async wait(): Promise<void> {
+        console.log(`🕒 Rate limiter check (minDelay=${this.minDelay}ms)`);
         const now     = Date.now();
         const elapsed = now - this.lastCallTime;
         if (elapsed < this.minDelay) {
@@ -165,6 +163,18 @@ interface ProviderConfig {
  * └──────────────────────────────┴──────┴──────────────┴─────────────────────┘
  */
 const PROVIDERS_CHAIN: ProviderConfig[] = [
+
+    // ── 1. Ollama (auto-hébergé sur Railway) ──────────────────────────
+    {
+        name: "Ollama Llama3.2 (Railway)",
+        rpm: 100, // valeur haute, pas de limite réelle
+        maxRetries: 2,
+        factory: (tools) => new ChatOllama({
+        baseUrl: process.env.OLLAMA_PUBLIC_URL,   // l'URL que vous avez notée
+        model: "llama3.2:3b",                     // le modèle que vous avez téléchargé
+        temperature: 0,
+        }).bindTools(tools),
+    },
 
     // ── 1. Cerebras gpt-oss-120b — ILLIMITÉ, 30 RPM, 120B params
     {
@@ -562,13 +572,14 @@ WORKFLOW CREATION DE COMPTE (a suivre dans CET ORDRE) :
 2. demarrer_sandbox si pas encore fait
 3. aller_vers_e2b vers la page d'inscription
 4. screenshot_e2b pour voir la page
-5. OBLIGATOIRE : appelle lire_page_e2b avec format="html" pour obtenir le code HTML.
+5. OBLIGATOIRE : appelle lire_page_e2b AVEC format="html" pour obtenir le code HTML complet.
    - Si le résultat est trop volumineux, il sera sauvegardé et tu recevras un chemin.
-   - Utilise grep_memoire ou evaluer_js_e2b pour analyser la structure.
-6. SI grep_memoire ne trouve rien, utilise immédiatement evaluer_js_e2b avec :
+   - Utilise immédiatement grep_memoire ou evaluer_js_e2b pour extraire les sélecteurs.
+   - NE PAS continuer sans avoir analysé la structure de la page.
+6. SI grep_memoire ne trouve rien, utilise evaluer_js_e2b avec le script suivant :
    Array.from(document.querySelectorAll('input, select, textarea, button'))
        .map(el => ({ tag: el.tagName, name: el.name, id: el.id, type: el.type }))
-   Cela te donnera une liste précise des champs, sans passer par le HTML.7. Cocher les cases : cocher_case_e2b
+7. Cocher les cases : cocher_case_e2b
 8. Menus deroulants : selectionner_option_e2b
 9. Valider : cliquer_e2b sur le bouton OU appuyer_touche_e2b "Enter"
 10. attendre_e2b (ms: 2000) apres soumission

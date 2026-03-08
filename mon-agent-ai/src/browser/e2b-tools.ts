@@ -173,6 +173,28 @@ export const selectionnerOptionE2B = tool(
     }
 );
 
+export const listerChampsFormulaire = tool(
+  async () => {
+    const script = `
+      Array.from(document.querySelectorAll('input, select, textarea, button'))
+          .map(el => ({
+              tag: el.tagName,
+              name: el.name,
+              id: el.id,
+              type: el.type,
+              placeholder: el.placeholder,
+              label: document.querySelector(\`label[for="\${el.id}"]\`)?.innerText || ''
+          }))
+    `;
+    return await e2bSandbox.evaluerJS(script);
+  },
+  {
+    name: "lister_champs_formulaire",
+    description: "Liste tous les champs (input, select, textarea, button) de la page courante avec leurs attributs.",
+    schema: z.object({}),
+  }
+);
+
 export const evaluerJSE2B = tool(
     async ({ script }) => {
         try { return await e2bSandbox.evaluerJS(script); }
@@ -199,5 +221,6 @@ export const e2bTools = [
     scrollerE2B,
     appuyerToucheE2B,
     selectionnerOptionE2B,
+    listerChampsFormulaire,
     evaluerJSE2B,
 ];
