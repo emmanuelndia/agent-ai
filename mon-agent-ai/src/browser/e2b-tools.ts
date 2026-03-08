@@ -2,6 +2,9 @@ import { tool } from "@langchain/core/tools";
 import { z } from "zod";
 import { e2bSandbox } from "./e2b-sandbox";
 
+// Cerebras/OpenAI structured outputs exigent optional() + nullable() ensemble
+const opt = <T extends z.ZodTypeAny>(s: T) => s.optional().nullable();
+
 export const demarrerSandbox = tool(
     async ({ headless }) => {
         try {
@@ -13,7 +16,7 @@ export const demarrerSandbox = tool(
         name: "demarrer_sandbox",
         description: "Démarre une sandbox E2B sécurisée avec navigateur.",
         schema: z.object({
-            headless: z.boolean().optional().default(false).describe("false = visible, true = invisible"),
+            headless: opt(z.boolean()).describe("false = visible, true = invisible (défaut: false)"),
         }),
     }
 );
@@ -41,8 +44,8 @@ export const cliquerE2B = tool(
         name: "cliquer_e2b",
         description: "Clique sur un élément dans la sandbox E2B. Préfère 'texte' pour les boutons.",
         schema: z.object({
-            selecteur: z.string().optional().describe("Sélecteur CSS"),
-            texte: z.string().optional().describe("Texte visible du bouton/lien"),
+            selecteur: opt(z.string()).describe("Sélecteur CSS"),
+            texte: opt(z.string()).describe("Texte visible du bouton/lien"),
         }),
     }
 );
@@ -58,7 +61,7 @@ export const taperE2B = tool(
         schema: z.object({
             selecteur: z.string().describe("Sélecteur CSS du champ"),
             texte: z.string().describe("Texte à taper"),
-            effacer: z.boolean().optional().default(true).describe("Effacer avant de taper (défaut: true)"),
+            effacer: opt(z.boolean()).describe("Effacer avant de taper (défaut: true)"),
         }),
     }
 );
@@ -72,8 +75,8 @@ export const lirePageE2B = tool(
         name: "lire_page_e2b",
         description: "Lit le contenu de la page dans la sandbox E2B.",
         schema: z.object({
-            format: z.enum(["texte", "html", "url", "titre"]).optional().default("texte").describe("Format (défaut: texte)"),
-            selecteur: z.string().optional().describe("Sélecteur CSS spécifique"),
+            format: opt(z.enum(["texte", "html", "url", "titre"])).describe("Format (défaut: texte)"),
+            selecteur: opt(z.string()).describe("Sélecteur CSS spécifique"),
         }),
     }
 );
@@ -87,7 +90,7 @@ export const screenshotE2B = tool(
         name: "screenshot_e2b",
         description: "Prend une capture d'écran dans la sandbox E2B.",
         schema: z.object({
-            nom: z.string().optional().describe("Nom du fichier sans extension"),
+            nom: opt(z.string()).describe("Nom du fichier sans extension"),
         }),
     }
 );
@@ -101,9 +104,9 @@ export const attendreE2B = tool(
         name: "attendre_e2b",
         description: "Attend dans la sandbox E2B (élément, texte ou temps).",
         schema: z.object({
-            ms: z.number().optional().describe("Durée en millisecondes"),
-            selecteur: z.string().optional().describe("Sélecteur CSS à attendre"),
-            texte: z.string().optional().describe("Texte à attendre"),
+            ms: opt(z.number()).describe("Durée en millisecondes"),
+            selecteur: opt(z.string()).describe("Sélecteur CSS à attendre"),
+            texte: opt(z.string()).describe("Texte à attendre"),
         }),
     }
 );
@@ -131,8 +134,8 @@ export const scrollerE2B = tool(
         name: "scroller_e2b",
         description: "Fait défiler la page dans la sandbox E2B.",
         schema: z.object({
-            direction: z.enum(["haut", "bas"]).optional().default("bas").describe("Direction (défaut: bas)"),
-            pixels: z.number().optional().default(400).describe("Pixels à défiler (défaut: 400)"),
+            direction: opt(z.enum(["haut", "bas"])).describe("Direction (défaut: bas)"),
+            pixels: opt(z.number()).describe("Pixels à défiler (défaut: 400)"),
         }),
     }
 );
@@ -144,10 +147,10 @@ export const appuyerToucheE2B = tool(
     },
     {
         name: "appuyer_touche_e2b",
-        description: "Appuie sur une touche clavier dans la sandbox E2B. Exemples : 'Enter' pour valider un formulaire, 'Tab' pour naviguer entre champs, 'Escape' pour fermer. Peut cibler un élément précis avec un sélecteur CSS.",
+        description: "Appuie sur une touche clavier dans la sandbox E2B.",
         schema: z.object({
             touche: z.string().describe("Touche : 'Enter', 'Tab', 'Escape', 'ArrowDown', 'Space', etc."),
-            selecteur: z.string().optional().describe("Sélecteur CSS optionnel de l'élément ciblé"),
+            selecteur: opt(z.string()).describe("Sélecteur CSS optionnel de l'élément ciblé"),
         }),
     }
 );
@@ -159,11 +162,11 @@ export const selectionnerOptionE2B = tool(
     },
     {
         name: "selectionner_option_e2b",
-        description: "Sélectionne une option dans un menu déroulant <select> dans la sandbox E2B. Utilise 'valeur' (attribut value) ou 'label' (texte visible).",
+        description: "Sélectionne une option dans un menu déroulant <select> dans la sandbox E2B.",
         schema: z.object({
             selecteur: z.string().describe("Sélecteur CSS du <select>"),
-            valeur: z.string().optional().describe("Valeur de l'option (attribut value)"),
-            label: z.string().optional().describe("Texte visible de l'option"),
+            valeur: opt(z.string()).describe("Valeur de l'option (attribut value)"),
+            label: opt(z.string()).describe("Texte visible de l'option"),
         }),
     }
 );
@@ -173,10 +176,7 @@ export const listerChampsFormulaire = tool(
     const script = `
       Array.from(document.querySelectorAll('input, select, textarea, button'))
           .map(el => ({
-              tag: el.tagName,
-              name: el.name,
-              id: el.id,
-              type: el.type,
+              tag: el.tagName, name: el.name, id: el.id, type: el.type,
               placeholder: el.placeholder,
               label: document.querySelector(\`label[for="\${el.id}"]\`)?.innerText || ''
           }))
@@ -185,7 +185,7 @@ export const listerChampsFormulaire = tool(
   },
   {
     name: "lister_champs_formulaire",
-    description: "Liste tous les champs (input, select, textarea, button) de la page courante avec leurs attributs.",
+    description: "Liste tous les champs (input, select, textarea, button) de la page courante.",
     schema: z.object({}),
   }
 );
@@ -197,25 +197,15 @@ export const evaluerJSE2B = tool(
     },
     {
         name: "evaluer_js_e2b",
-        description: "Exécute du JavaScript directement sur la page dans la sandbox E2B. Utile pour lire des données dynamiques, forcer des valeurs de champs, ou interagir avec des éléments inaccessibles autrement.",
+        description: "Exécute du JavaScript directement sur la page dans la sandbox E2B.",
         schema: z.object({
-            script: z.string().describe("Code JavaScript à exécuter sur la page (ex: 'document.title' ou 'document.querySelector(\"#email\").value')"),
+            script: z.string().describe("Code JavaScript à exécuter sur la page"),
         }),
     }
 );
 
 export const e2bTools = [
-    demarrerSandbox,
-    allerversE2B,
-    cliquerE2B,
-    taperE2B,
-    lirePageE2B,
-    screenshotE2B,
-    attendreE2B,
-    cocherCaseE2B,
-    scrollerE2B,
-    appuyerToucheE2B,
-    selectionnerOptionE2B,
-    listerChampsFormulaire,
-    evaluerJSE2B,
+    demarrerSandbox, allerversE2B, cliquerE2B, taperE2B, lirePageE2B,
+    screenshotE2B, attendreE2B, cocherCaseE2B, scrollerE2B,
+    appuyerToucheE2B, selectionnerOptionE2B, listerChampsFormulaire, evaluerJSE2B,
 ];
