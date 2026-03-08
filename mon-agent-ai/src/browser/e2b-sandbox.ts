@@ -6,7 +6,10 @@ export class E2BSandbox {
   private sandbox: Sandbox | null = null;
   private browserReady = false;
   private lastActivity = 0;
-  private readonly SANDBOX_TIMEOUT_MS = 4.5 * 60 * 1000; // 4min30 (expire à 5min)
+  // E2B expire à 5min d'inactivité. On prolonge à 9min en pinguant toutes les 3min.
+  private readonly SANDBOX_TIMEOUT_MS = 9 * 60 * 1000; // 9min (keepalive actif)
+  private readonly KEEPALIVE_INTERVAL_MS = 3 * 60 * 1000; // ping toutes les 3min
+  private keepaliveTimer: ReturnType<typeof setInterval> | null = null;
   private readonly screenshotsDir = path.resolve("./screenshots");
 
   constructor() {
@@ -15,14 +18,28 @@ export class E2BSandbox {
     }
   }
 
-  // ── Auto-recovery ──────────────────────────────────────────────────────────
-  // Appelé avant chaque opération. Vérifie que le sandbox et le navigateur
-  // sont vivants. Réinitialise automatiquement si :
-  //   - sandbox jamais démarré
-  //   - inactivité > 4min30 (expire à 5min chez E2B)
-  //   - ping Python échoue (kernel mort)
-  //   - erreur 502 (sandbox remote disparu)
-  // ──────────────────────────────────────────────────────────────────────────
+  // ── Keepalive : ping E2B toutes les 3min pour éviter l'expiration à 5min ──
+  private startKeepalive(): void {
+    this.stopKeepalive();
+    this.keepaliveTimer = setInterval(async () => {
+      if (!this.sandbox || !this.browserReady) { this.stopKeepalive(); return; }
+      try {
+        await this.sandbox.runCode("print('keepalive')");
+        this.lastActivity = Date.now();
+        console.log("🔁 E2B keepalive OK");
+      } catch {
+        console.log("⚠️  E2B keepalive échoué — sandbox probablement expiré");
+        this.stopKeepalive();
+      }
+    }, this.KEEPALIVE_INTERVAL_MS);
+  }
+
+  private stopKeepalive(): void {
+    if (this.keepaliveTimer) {
+      clearInterval(this.keepaliveTimer);
+      this.keepaliveTimer = null;
+    }
+  }
   private async assureSandboxVivant(): Promise<string | null> {
     const now = Date.now();
     const expired = this.lastActivity > 0 && (now - this.lastActivity) > this.SANDBOX_TIMEOUT_MS;
@@ -57,6 +74,7 @@ export class E2BSandbox {
 
   private async _initialiser(headless = true): Promise<string | null> {
     // Fermer proprement si existant
+    this.stopKeepalive();
     if (this.sandbox) {
       try { await this.sandbox.kill(); } catch {}
       this.sandbox = null;
@@ -64,7 +82,8 @@ export class E2BSandbox {
     }
 
     try {
-      this.sandbox = await Sandbox.create({ timeoutMs: 5 * 60 * 1000 });
+      // 10min côté E2B — le keepalive interne pingue toutes les 3min
+      this.sandbox = await Sandbox.create({ timeoutMs: 10 * 60 * 1000 });
 
       const installResult = await this.sandbox.runCode(`
 import subprocess, sys
@@ -98,6 +117,7 @@ await setup()
 
       this.browserReady = true;
       this.lastActivity = Date.now();
+      this.startKeepalive(); // 🔁 ping toutes les 3min pour éviter l'expiration
       return null; // succès
     } catch (e) {
       return `❌ Init E2B : ${(e as Error).message}`;
@@ -209,8 +229,11 @@ async def shot():
 await shot()
 `);
       if (result.error) return `❌ Screenshot : ${result.error.value}\n${result.error.traceback}`;
-      const b64 = result.logs?.stdout?.join('') || result.text;
+      // Trim : print() ajoute un \n final qui corrompt le base64 dans le navigateur
+      const b64Raw = result.logs?.stdout?.join('') || result.text || '';
+      const b64 = b64Raw.replace(/\s+/g, ''); // supprime \n, espaces, retours chariot
       if (!b64) return "❌ Screenshot : aucune donnée reçue";
+      if (b64.length < 100) return `❌ Screenshot : données invalides (${b64.length} chars)`;
       this.lastActivity = Date.now();
       return `data:image/png;base64,${b64}`;
     } catch (e) { return `❌ Screenshot : ${(e as Error).message}`; }
@@ -275,6 +298,7 @@ await scroll()
   }
 
   async fermer(): Promise<void> {
+    this.stopKeepalive();
     if (this.sandbox) {
       try {
         await this.sandbox.runCode(`

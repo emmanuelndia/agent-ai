@@ -539,7 +539,12 @@ REGLES D'OR :
 5. Si tu rencontres une erreur, NOTE-LA dans le todo (champ note de l'etape).
    Ne cache jamais une erreur — elle met a jour tes croyances et evite la repetition.
 6. Si l'utilisateur te donne un conseil, utilise apprendre_instruction.
-7. Prends un screenshot avant/apres chaque action cle.
+7. SCREENSHOT OBLIGATOIRE : appelle TOUJOURS screenshot_e2b dans ces cas :
+   - L'utilisateur demande explicitement une capture, screenshot ou photo.
+   - Apres chaque navigation (aller_vers_e2b), clic (cliquer_e2b) ou saisie (taper_e2b).
+   - Avant et apres toute action cle sur un formulaire.
+   - Si le navigateur est ouvert et que l'utilisateur pose une question sur la page.
+   NE JAMAIS repondre "j'ai effectue l'action" sans appeler screenshot_e2b juste avant.
 8. Utilise attendre_e2b pour laisser le temps aux elements d'apparaitre.
 
 SELECTEURS COURANTS :
@@ -937,8 +942,18 @@ export interface AgentResponse {
 
 export async function traiterMessage(messageUtilisateur: string): Promise<AgentResponse> {
     try {
-        const messageEntrant = new HumanMessage(messageUtilisateur);
-        await contextManager.addMessage(messageEntrant);
+        // ── Détection de demande de screenshot explicite ──────────────────────
+        // Si l'utilisateur demande une capture, on injecte un rappel fort dans
+        // le message pour contourner les LLMs (ex: Mistral small) qui ignorent
+        // les consignes implicites du system prompt.
+        const motsClesCapture = /capture|screenshot|photo|image|montre|affiche|vois|voir la page/i;
+        const demandeCapture = motsClesCapture.test(messageUtilisateur);
+        const messageInjecte = demandeCapture
+            ? `${messageUtilisateur}\n[INSTRUCTION CRITIQUE : Tu DOIS appeler screenshot_e2b maintenant. C'est obligatoire.]`
+            : messageUtilisateur;
+
+        const messageEntrant = new HumanMessage(messageInjecte);
+        await contextManager.addMessage(new HumanMessage(messageUtilisateur)); // contexte sans injection
 
         const resultat = await graphe.invoke(
             { messages: [messageEntrant] },
