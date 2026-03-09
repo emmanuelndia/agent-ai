@@ -50,10 +50,10 @@ function classifierErreur(error: any): ErrorKind {
         (msg.includes("quota") && msg.includes("exceeded") && msg.includes("day"))
     ) return "QUOTA_EXHAUSTED";
 
-    // 413 = contexte trop grand pour CE modèle → skip immédiat, 0 retry
-    // DOIT être avant RATE_LIMIT (sinon le 429 capte tout)
+    // 413 = contexte trop grand pour CETTE requête → SKIP (provider réutilisable pour la suivante)
+    // NE PAS mettre QUOTA_EXHAUSTED sinon le provider est banni toute la session
     if (status === 413 || msg.includes("request too large") || msg.includes("too large for model")) {
-        return "QUOTA_EXHAUSTED";
+        return "SKIP";
     }
 
     if (
@@ -358,12 +358,22 @@ class MultiProviderLLM {
         // Chercher le premier provider disponible — à chaque appel, pas en continu
         let startIndex = this.premierDisponible();
 
+        // Log de diagnostic : providers épuisés pour cette session
+        const epuises = PROVIDERS_CHAIN.filter((_, i) => this.quotaEpuise.get(i)).map(p => p.name);
+        if (epuises.length > 0) {
+            console.log(`⚠️  Providers bannis cette session : ${epuises.join(", ")}`);
+        }
+
         if (startIndex < 0) {
             throw new Error(
                 "Tous les providers LLM ont atteint leur quota journalier. " +
                 "Reessaie demain ou active la facturation sur une cle API."
             );
         }
+
+        // Flag : au moins un provider a été rate-limité pendant cet invoke
+        // Permet de distinguer "contexte cassé" (SKIP) de "providers saturés" (RATE_LIMIT)
+        let wasRateLimited = false;
 
         // Essayer chaque provider disponible dans l'ordre
         for (let i = startIndex; i < PROVIDERS_CHAIN.length; i++) {
@@ -412,14 +422,15 @@ class MultiProviderLLM {
                             const match    = error?.message?.match(/retry[^0-9]*(\d+(?:\.\d+)?)\s*s/i);
                             const suggest  = match ? parseFloat(match[1]) * 1000 : 0;
                             // Cooldown minimum basé sur le rpm du provider :
-                            // Si rpm=4 → 1 call / 15s. Après un 429, attendre au moins 1 fenêtre complète.
                             const rpmCooldown = Math.ceil((60 / config.rpm) * 1000 * 3); // 3× la fenêtre RPM
-                            // Exponentiel classique mais avec un floor raisonnable
                             const expBackoff  = Math.pow(2, attempt + 2) * 1000; // 4s, 8s, 16s...
                             const waitMs      = Math.max(suggest, rpmCooldown, expBackoff);
                             console.warn(`Rate limit - attente ${Math.round(waitMs / 1000)}s... (rpm=${config.rpm}, suggest=${Math.round(suggest/1000)}s)`);
                             this.rateLimitedUntil.set(i, Date.now() + waitMs);
-                            await sleep(waitMs);
+                            wasRateLimited = true;
+                            // Ne pas dormir ici : passer directement au provider suivant
+                            // Le cooldown sera respecté au prochain tour de boucle externe
+                            attempt = config.maxRetries; // forcer la sortie de la boucle inner
                             break;
                         }
 
@@ -456,20 +467,19 @@ class MultiProviderLLM {
             );
         }
 
-        // Distinguer : tous rate-limités (contexte peut être valide) vs contexte cassé (SKIP)
-        // Si des providers sont encore en cooldown → c'est un problème de rate limit, pas de contexte
-        const nowCheck = Date.now();
-        let nbRateLimites = 0;
-        this.rateLimitedUntil.forEach((until, i) => {
-            if (!this.quotaEpuise.get(i) && until > nowCheck) nbRateLimites++;
-        });
-        if (nbRateLimites > 0) {
-            // Le contexte est peut-être bon mais tous les providers dispo sont en cooldown
-            console.warn(`⚠️  Tous les providers non-épuisés sont en rate-limit. Lancer resetRateLimits() pour débloquer.`);
+        // wasRateLimited = au moins un provider a hit une rate limit → contexte potentiellement valide
+        // pas de wasRateLimited = tous ont SKIPpé → contexte structurellement cassé
+        if (wasRateLimited) {
+            const prochainDisponible = Math.min(
+                ...Array.from(this.rateLimitedUntil.entries())
+                    .filter(([i]) => !this.quotaEpuise.get(i))
+                    .map(([, until]) => Math.max(0, until - Date.now()))
+            );
+            console.warn(`⚠️  Tous les providers en rate-limit. Prochain dispo dans ~${Math.round(prochainDisponible/1000)}s`);
             throw new Error("ALL_RATE_LIMITED");
         }
 
-        // Certains ont SKIPpé → contexte cassé mais providers disponibles
+        // Aucun rate-limit, mais tous ont SKIPpé → contexte structurellement cassé
         throw new Error("CONTEXT_INCOMPATIBLE");
     }
 }
