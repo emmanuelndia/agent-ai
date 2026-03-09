@@ -286,7 +286,6 @@ await type_text()
       if (result.error) return `❌ Saisie : ${result.error.value}\n${result.error.traceback}`;
       this.lastActivity = Date.now();
       return `✅ Texte "${options.texte}" saisi dans ${options.selecteur}`;
-      return `✅ Texte "${options.texte}" saisi dans ${options.selecteur}`;
     } catch (e) { return `❌ Saisie : ${(e as Error).message}`; }
   }
 

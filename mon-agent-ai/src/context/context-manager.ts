@@ -251,8 +251,9 @@ export class AdvancedContextManager {
         const context: BaseMessage[] = [];
 
         // 1. System prompt — STABLE, jamais modifié → pleinement caché par KV
-        //    Important : ne PAS injecter de contenu dynamique ici
-        context.push(new HumanMessage(systemPrompt));
+        //    Envoyé comme SystemMessage pour que Mistral/OpenAI le traitent correctement
+        //    (les providers qui ne supportent pas SystemMessage le convertissent en HumanMessage)
+        context.push(new SystemMessage(systemPrompt));
 
         // 2. Résumés si disponibles — ajoutés APRÈS le system prompt stable
         //    Ils ne changent pas entre les tours → préfixe étendu caché

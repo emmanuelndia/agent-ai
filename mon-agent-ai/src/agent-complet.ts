@@ -84,6 +84,13 @@ function classifierErreur(error: any): ErrorKind {
         msg.includes("unauthorized")
     ) return "QUOTA_EXHAUSTED";
 
+    // 400 sans body = contexte mal formé pour CE modèle (ex: Cerebras llama3.1-8b
+    // rejette certains tool_calls avec 400 sans aucun message d'erreur explicite)
+    // => SKIP : le provider reste utilisable pour la prochaine requête
+    if (status === 400 && (msg === "" || msg === "400 status code (no body)" || msg.length < 30)) {
+        return "SKIP";
+    }
+
     // Erreurs de FORMAT de contexte => SKIP (provider reste utilisable pour la prochaine requete)
     if (
         msg.includes("tool call id has to be defined") ||
