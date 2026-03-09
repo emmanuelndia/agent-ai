@@ -109,17 +109,17 @@ function classifierErreur(error: any): ErrorKind {
         msg.includes("invalid_request_message") ||
         msg.includes("all openai tool calls must have an") ||
         msg.includes("\"id\" field") ||
-        // Mistral : nombre de tool_calls ≠ nombre de ToolMessages dans le contexte
         msg.includes("not the same number of function calls") ||
-        // Mistral rejette un AIMessage avec content="" ET sans tool_calls
-        // Se produit quand un provider renvoie une réponse vide et qu'on la passe en contexte
         msg.includes("assistant message must have either content or tool_calls") ||
-        // Cohere : null dans les parameters (champs optional/nullable du schema Zod)
         msg.includes("expected object. received null") ||
         msg.includes("toolresults") ||
-        // Groq / OpenAI : message de rôle invalide dans le contexte
         msg.includes("invalid role") ||
-        msg.includes("last message must be")
+        msg.includes("last message must be") ||
+        // Groq : échec d'appel d'outil (prompt trop complexe ou contexte mal formé)
+        // → SKIP : le provider reste utilisable pour la prochaine requête
+        msg.includes("tool_use_failed") ||
+        msg.includes("failed to call a function") ||
+        msg.includes("please adjust your prompt")
     ) {
         return "SKIP";
     }
