@@ -701,9 +701,11 @@ async function noeudLLM(etat: typeof EtatAgent.State) {
         const stats = contextManager.getContextStats();
         console.log(`Contexte : ${stats.totalMessages} msgs | ${stats.currentTokens} tokens | compression : ${((1 - stats.compressionRatio) * 100).toFixed(0)}%`);
 
-        // Fenetre glissante : 6 derniers messages seulement
-        // Groq llama-3.1-8b fait du 413 au-dela de ~4000 tokens dans messages[]
-        const MAX_RECENT = 6;
+        // Fenetre glissante : 12 derniers messages
+        // 6 était trop petit → l'agent oubliait les actions déjà faites et les répétait
+        // (ex: demarrer_sandbox appelé 2x, generate_mot_de_passe 2x)
+        // Groq llama-3.1-8b fait du 413 au-delà de ~6000 tokens → on sanitise après
+        const MAX_RECENT = 12;
         const recent = etat.messages.length > MAX_RECENT
             ? etat.messages.slice(-MAX_RECENT)
             : etat.messages;
@@ -808,7 +810,7 @@ const graphe = new StateGraph(EtatAgent)
     .addConditionalEdges("llm", decider)
     .addEdge("tools", "llm")
     .compile()
-    .withConfig({ recursionLimit: 25 });
+    .withConfig({ recursionLimit: 50 });
 
 // ─────────────────────────────────────────────────────────────────────────────
 // API PUBLIQUE
@@ -846,9 +848,15 @@ export async function traiterMessage(messageUtilisateur: string): Promise<AgentR
         await contextManager.addMessage(new AIMessage(contenu));
         return { text: contenu, screenshot: screenshotData };
 
-    } catch (error) {
+    } catch (error: any) {
         console.error("Erreur dans traiterMessage:", error);
-        const fallback = "Desole, une erreur interne est survenue.";
+        const isRecursionLimit =
+            error?.lc_error_code === "GRAPH_RECURSION_LIMIT" ||
+            String(error?.message).includes("Recursion limit") ||
+            String(error?.message).includes("GRAPH_RECURSION_LIMIT");
+        const fallback = isRecursionLimit
+            ? "⚠️ L'agent a atteint la limite d'étapes (tâche trop longue ou boucle). Reformule en étapes plus courtes ou tape 'reset'."
+            : "Desole, une erreur interne est survenue.";
         await contextManager.addMessage(new AIMessage(fallback));
         return { text: fallback };
     }
