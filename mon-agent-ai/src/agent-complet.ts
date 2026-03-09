@@ -1,22 +1,16 @@
 import { ChatGroq } from "@langchain/groq";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
-// ChatMistralAI supprimé : SDK @mistralai/mistralai ignorait maxRetries:0 et faisait 5 retries cachés.
-// Mistral est maintenant utilisé via ChatOpenAI + baseURL "https://api.mistral.ai/v1" (OpenAI-compatible).
-import { ChatOpenAI } from "@langchain/openai";   // ← Cerebras via wrapper OpenAI-compatible
+import { ChatOpenAI } from "@langchain/openai";
 import { ChatCohere } from "@langchain/cohere";
-// ChatCerebras (@langchain/cerebras) SUPPRIMÉ : incompatible avec @langchain/core@0.3.x
-// Cerebras est utilisé via ChatOpenAI avec baseURL custom (zéro conflit de dépendance)
 import { StateGraph, Annotation, END, START } from "@langchain/langgraph";
 import { ToolNode } from "@langchain/langgraph/prebuilt";
 import { HumanMessage, AIMessage, BaseMessage, ToolMessage } from "@langchain/core/messages";
 import { InMemoryChatMessageHistory } from "@langchain/core/chat_history";
-import { InMemoryCache } from "@langchain/core/caches";
 import { outilsDeBase } from "./tools";
-import { browserTools } from "./browser/browser-tools";
 import { e2bTools } from "./browser/e2b-tools";
 import { credentialTools } from "./browser/credentials";
 import { debugTools } from "./browser/debug-tools";
-import { fsMemoryTools, offloadSiVolumineux, INSTRUCTIONS_FILE, TODO_FILE } from "./memory/fs-memory";
+import { fsMemoryTools, offloadSiVolumineux, INSTRUCTIONS_FILE } from "./memory/fs-memory";
 import { navigateur } from "./browser/browser-manager";
 import { e2bSandbox } from "./browser/e2b-sandbox";
 import { AdvancedContextManager, ContextConfig } from "./context/context-manager";
@@ -27,44 +21,47 @@ import console from "console";
 
 dotenv.config();
 
-// UTILITAIRES
+// ─────────────────────────────────────────────────────────────────────────────
+// UTILS
+// ─────────────────────────────────────────────────────────────────────────────
 
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
-// CLASSIFICATION DES ERREURS API
+// ─────────────────────────────────────────────────────────────────────────────
+// CLASSIFICATION DES ERREURS
+// ─────────────────────────────────────────────────────────────────────────────
 
-type ErrorKind =
-    | "QUOTA_EXHAUSTED"  // quota journalier épuisé → skip définitif dans la session
-    | "SKIP"     // erreur de format pour CETTE requête → skip mais provider réutilisable
-    | "RATE_LIMIT"       // trop de requêtes → attendre et réessayer
-    | "RETRYABLE"        // erreur temporaire → réessayer
-    | "FATAL";           // erreur irrécupérable → stopper
+type ErrorKind = "QUOTA_EXHAUSTED" | "SKIP" | "RATE_LIMIT" | "RETRYABLE" | "FATAL";
 
 function classifierErreur(error: any): ErrorKind {
     const msg    = (error?.message ?? "").toLowerCase();
     const status = error?.status ?? 0;
 
+    // Quota journalier epuise
     if (
         msg.includes("limit: 0") ||
         msg.includes("per_day") ||
         (msg.includes("quota") && msg.includes("exceeded") && msg.includes("day"))
     ) return "QUOTA_EXHAUSTED";
 
-    // 413 = contexte trop grand pour CETTE requête → SKIP (provider réutilisable pour la suivante)
-    // NE PAS mettre QUOTA_EXHAUSTED sinon le provider est banni toute la session
+    // 413 = contexte trop grand pour CETTE requete seulement => SKIP (provider reutilisable)
     if (status === 413 || msg.includes("request too large") || msg.includes("too large for model")) {
         return "SKIP";
     }
 
+    // Rate limit
     if (
         status === 429 ||
         msg.includes("rate_limit") ||
         msg.includes("rate limit") ||
         msg.includes("too many requests") ||
         msg.includes("resource_exhausted") ||
+        msg.includes("max retries reached") ||
+        msg.includes("max retries exceeded") ||
         (msg.includes("quota") && msg.includes("exceeded") && !msg.includes("day"))
     ) return "RATE_LIMIT";
 
+    // Erreurs temporaires
     if (
         status === 503 ||
         msg.includes("overloaded") ||
@@ -72,90 +69,47 @@ function classifierErreur(error: any): ErrorKind {
         msg.includes("unavailable")
     ) return "RETRYABLE";
 
-    // Mistral SDK : retente les 429 en interne jusqu'à 5x puis throw "Max retries reached"
-    // Le maxRetries:0 de ChatMistralAI n'est pas respecté par le SDK natif @mistralai/mistralai
-    // → classifier comme RATE_LIMIT pour mettre le provider en cooldown au lieu de crasher
-    if (msg.includes("max retries reached") || msg.includes("max retries exceeded")) {
-        return "RATE_LIMIT";
-    }
+    // Modele introuvable ou incompatibilite schema Cohere => ban definitif
+    if (
+        status === 404 ||
+        msg.includes("model_not_found") ||
+        msg.includes("missing required key") ||
+        msg.includes("parameterdefinitions")
+    ) return "QUOTA_EXHAUSTED";
 
-    // 404 = modèle introuvable → passer au suivant
-    if (status === 404 || msg.includes("model_not_found") || msg.includes("no body")) {
-        return "QUOTA_EXHAUSTED";
-    }
-
-    // 413 → géré en premier dans le classifier
-    // Cohere : "Missing required key type" = incompatibilité de schema → passer au suivant
-    if (msg.includes("missing required key") || msg.includes("parameterdefinitions")) {
-        return "QUOTA_EXHAUSTED";
-    }
-
-    // Erreurs d'authentification → quota épuisé (clé invalide/absente pour cette session)
+    // Auth invalide
     if (
         status === 401 ||
         msg.includes("invalid api key") ||
-        msg.includes("authentication") ||
-        msg.includes("api key") ||
         msg.includes("unauthorized")
-    ) {
-        return "QUOTA_EXHAUSTED";
-    }
+    ) return "QUOTA_EXHAUSTED";
 
-    // Mistral / OpenAI : erreurs de FORMAT de message → SKIP (provider réutilisable)
+    // Erreurs de FORMAT de contexte => SKIP (provider reste utilisable pour la prochaine requete)
     if (
         msg.includes("tool call id has to be defined") ||
         msg.includes("expected last role") ||
         msg.includes("message_order") ||
         msg.includes("invalid_request_message") ||
         msg.includes("all openai tool calls must have an") ||
-        msg.includes("\"id\" field") ||
         msg.includes("not the same number of function calls") ||
         msg.includes("assistant message must have either content or tool_calls") ||
         msg.includes("expected object. received null") ||
         msg.includes("toolresults") ||
         msg.includes("invalid role") ||
         msg.includes("last message must be") ||
-        // Groq : échec d'appel d'outil (prompt trop complexe ou contexte mal formé)
-        // → SKIP : le provider reste utilisable pour la prochaine requête
         msg.includes("tool_use_failed") ||
         msg.includes("failed to call a function") ||
-        msg.includes("please adjust your prompt")
-    ) {
-        return "SKIP";
-    }
-
-    // Gemini thinking : thought_signature manquant → skip cette requête
-    if (msg.includes("thought_signature") || msg.includes("missing a thought")) {
-        return "SKIP";
-    }
+        msg.includes("please adjust your prompt") ||
+        msg.includes("thought_signature") ||
+        msg.includes("missing a thought")
+    ) return "SKIP";
 
     return "FATAL";
 }
 
-// RATE LIMITER
-
-class RateLimiter {
-    private lastCallTime = 0;
-    private readonly minDelay: number;
-
-    constructor(requestsPerMinute: number) {
-        // Facteur 1.2 de sécurité pour absorber les jitters réseau
-        this.minDelay = Math.ceil((60 / requestsPerMinute) * 1000 * 1.2);
-    }
-
-    async wait(): Promise<void> {
-        console.log(`🕒 Rate limiter check (minDelay=${this.minDelay}ms)`);
-        const now     = Date.now();
-        const elapsed = now - this.lastCallTime;
-        if (elapsed < this.minDelay) {
-            const waitMs = this.minDelay - elapsed;
-            console.log(`🕒 Rate limiter : pause ${Math.round(waitMs)}ms...`);
-            await sleep(waitMs);
-        }
-        this.lastCallTime = Date.now();
-    }
-}
-
+// ─────────────────────────────────────────────────────────────────────────────
+// PROVIDERS
+// ─────────────────────────────────────────────────────────────────────────────
 
 interface ProviderConfig {
     name: string;
@@ -164,327 +118,250 @@ interface ProviderConfig {
     factory: (tools: any[]) => any;
 }
 
-/**
- * Chaîne de fallback — ordre optimisé par quota/jour puis qualité.
- *
- * STRATÉGIE : illimités en tête, quotas limités en dernier recours.
- *
- * ┌──────────────────────────────┬──────┬──────────────┬─────────────────────┐
- * │ Provider / Modèle            │ RPM  │ Req/jour     │ Notes               │
- * ├──────────────────────────────┼──────┼──────────────┼─────────────────────┤
- * │ Cerebras gpt-oss-120b        │  30  │   14 400     │ Principal — 120B    │
- * │ Cerebras llama3.1-8b         │  30  │   14 400 *   │ Quota séparé        │
- * │ Mistral small                │   4  │  ILLIMITÉ    │ Via OpenAI endpoint │
- * │ Groq llama-3.3-70b           │  20  │   14 400     │ Fallback capable    │
- * │ Groq llama-3.1-8b            │  20  │   14 400 *   │ Quota séparé        │
- * │ Gemini 2.0 Flash             │  15  │    1 500     │ Précieux, last res. │
- * │ Gemini 2.5 Flash             │   9  │      500 *   │ Quota séparé        │
- * │ Cohere command-r             │  20  │    1 000     │ Skip auto (schema)  │
- * └──────────────────────────────┴──────┴──────────────┴─────────────────────┘
- */
 const PROVIDERS_CHAIN: ProviderConfig[] = [
-
-    // ── 1. Cerebras gpt-oss-120b — ILLIMITÉ, 30 RPM, 120B params
     {
-        name: "Cerebras gpt-oss-120b",
-        rpm: 28,  // légèrement sous les 30 officiels pour absorber les jitters
-        maxRetries: 3,
+        name: "Cerebras gpt-oss-120b", rpm: 28, maxRetries: 2,
         factory: (tools) => new ChatOpenAI({
-            model: "gpt-oss-120b",
-            temperature: 0,
+            model: "gpt-oss-120b", temperature: 0,
             apiKey: process.env.CEREBRAS_API_KEY,
             configuration: { baseURL: "https://api.cerebras.ai/v1" },
             maxRetries: 0,
         }).bindTools(tools, { strict: false }),
     },
-
-    // ── 2. Cerebras llama3.1-8b — quota SÉPARÉ du 120b, très rapide
     {
-        name: "Cerebras llama3.1-8b",
-        rpm: 28,
-        maxRetries: 3,
+        name: "Cerebras llama3.1-8b", rpm: 28, maxRetries: 2,
         factory: (tools) => new ChatOpenAI({
-            model: "llama3.1-8b",
-            temperature: 0,
+            model: "llama3.1-8b", temperature: 0,
             apiKey: process.env.CEREBRAS_API_KEY,
             configuration: { baseURL: "https://api.cerebras.ai/v1" },
             maxRetries: 0,
         }).bindTools(tools, { strict: false }),
     },
-
-    // ── 3. Mistral small — ILLIMITÉ (1 Md tokens/mois), 4 RPM
-    //       VIA endpoint OpenAI-compatible (pas le SDK @mistralai/mistralai)
-    //       Le SDK natif ignorait maxRetries:0 et faisait 5 retries HTTP cachés.
-    //       ChatOpenAI + baseURL custom = contrôle total, maxRetries:0 respecté.
     {
-        name: "Mistral small",
-        rpm: 4,
-        maxRetries: 1,
+        name: "Mistral small", rpm: 4, maxRetries: 1,
         factory: (tools) => new ChatOpenAI({
-            model: "mistral-small-latest",
-            temperature: 0,
+            model: "mistral-small-latest", temperature: 0,
             apiKey: process.env.MISTRAL_API_KEY,
             configuration: { baseURL: "https://api.mistral.ai/v1" },
-            maxRetries: 0,  // respecté car ChatOpenAI, pas @mistralai/mistralai
+            maxRetries: 0,
         }).bindTools(tools, { strict: false }),
     },
-
-    // ── 3. Groq llama-3.3-70b — 14 400 req/jour, très capable, 30 RPM réels
     {
-        name: "Groq llama-3.3-70b",
-        rpm: 20,   // conservateur : 30 RPM officiel mais on partage avec llama-3.1-8b
-        maxRetries: 2,
+        name: "Groq llama-3.3-70b", rpm: 20, maxRetries: 1,
         factory: (tools) => new ChatGroq({
-            model: "llama-3.3-70b-versatile",
-            temperature: 0,
-            apiKey: process.env.GROQ_API_KEY,
-            maxRetries: 0,
+            model: "llama-3.3-70b-versatile", temperature: 0,
+            apiKey: process.env.GROQ_API_KEY, maxRetries: 0,
         }).bindTools(tools),
     },
-
-    // ── 4. Groq llama-3.1-8b — quota SÉPARÉ du 3.3-70b
     {
-        name: "Groq llama-3.1-8b",
-        rpm: 20,
-        maxRetries: 2,
+        name: "Groq llama-3.1-8b", rpm: 20, maxRetries: 1,
         factory: (tools) => new ChatGroq({
-            model: "llama-3.1-8b-instant",
-            temperature: 0,
-            apiKey: process.env.GROQ_API_KEY,
-            maxRetries: 0,
+            model: "llama-3.1-8b-instant", temperature: 0,
+            apiKey: process.env.GROQ_API_KEY, maxRetries: 0,
         }).bindTools(tools),
     },
-
-    // ── 5. Gemini 2.0 Flash — 1 500 req/jour, meilleur pour l'agentic
-    //       Quota PRÉCIEUX → réservé en dernier recours
     {
-        name: "Gemini 2.0 Flash",
-        rpm: 15,   // 15 RPM officiels niveau free
-        maxRetries: 3,
+        name: "Gemini 2.0 Flash", rpm: 15, maxRetries: 2,
         factory: (tools) => new ChatGoogleGenerativeAI({
-            model: "gemini-2.0-flash",
-            temperature: 0,
-            apiKey: process.env.GOOGLE_API_KEY,
-            maxRetries: 0,
+            model: "gemini-2.0-flash", temperature: 0,
+            apiKey: process.env.GOOGLE_API_KEY, maxRetries: 0,
         }).bindTools(tools),
     },
-
-    // ── 6. Gemini 2.5 Flash — 500 req/jour, quota SÉPARÉ du 2.0
     {
-        name: "Gemini 2.5 Flash",
-        rpm: 9,
-        maxRetries: 3,
+        name: "Gemini 2.5 Flash", rpm: 9, maxRetries: 2,
         factory: (tools) => new ChatGoogleGenerativeAI({
-            model: "gemini-2.5-flash",
-            temperature: 0,
-            apiKey: process.env.GOOGLE_API_KEY,
-            maxRetries: 0,
+            model: "gemini-2.5-flash", temperature: 0,
+            apiKey: process.env.GOOGLE_API_KEY, maxRetries: 0,
         }).bindTools(tools),
     },
-
-    // ── 7. Cohere command-r — sera skipé auto (incompatibilité schema tools)
-    //       Gardé comme dernier filet
     {
-        name: "Cohere command-r",
-        rpm: 20,
-        maxRetries: 2,
+        name: "Cohere command-r", rpm: 20, maxRetries: 1,
         factory: (tools) => new ChatCohere({
-            model: "command-r",
-            temperature: 0,
-            apiKey: process.env.COHERE_API_KEY,
-            maxRetries: 0,
+            model: "command-r", temperature: 0,
+            apiKey: process.env.COHERE_API_KEY, maxRetries: 0,
         }).bindTools(tools, { strict: false }),
     },
-
-    // gemini-3-flash-preview DÉSACTIVÉ : exige thought_signatures incompatibles
 ];
 
-class MultiProviderLLM {
-    // ── État par provider ─────────────────────────────────────────────────────
-    // quotaEpuise[i] = true  → quota journalier épuisé, skip définitivement
-    // rateLimitedUntil[i]    → timestamp jusqu'auquel ce provider est en cooldown
-    //
-    // IMPORTANT : ces états persistent entre les requêtes (même instance).
-    // currentIndex est recalculé dynamiquement à chaque invoke() pour trouver
-    // le premier provider disponible — il ne se bloque plus jamais en fin de liste.
-    // ─────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// MULTI-PROVIDER LLM
+// ─────────────────────────────────────────────────────────────────────────────
 
+class MultiProviderLLM {
     private quotaEpuise      = new Map<number, boolean>();
     private rateLimitedUntil = new Map<number, number>();
-    private rateLimiters     = new Map<number, RateLimiter>();
+    private lastCallTime     = new Map<number, number>();
     private instances        = new Map<number, any>();
     private tools: any[];
 
     constructor(tools: any[]) {
         this.tools = tools;
-        PROVIDERS_CHAIN.forEach((p, i) => {
-            this.rateLimiters.set(i, new RateLimiter(p.rpm));
+        PROVIDERS_CHAIN.forEach((_, i) => {
             this.quotaEpuise.set(i, false);
             this.rateLimitedUntil.set(i, 0);
+            this.lastCallTime.set(i, 0);
         });
     }
 
-    private getInstance(index: number): any {
-        if (!this.instances.has(index)) {
-            console.log(`Initialisation provider : ${PROVIDERS_CHAIN[index].name}`);
-            this.instances.set(index, PROVIDERS_CHAIN[index].factory(this.tools));
+    private getInstance(i: number): any {
+        if (!this.instances.has(i)) {
+            this.instances.set(i, PROVIDERS_CHAIN[i].factory(this.tools));
         }
-        return this.instances.get(index)!;
+        return this.instances.get(i)!;
     }
 
-    // Retourne le premier provider disponible (non épuisé, non en cooldown)
-    private premierDisponible(): number {
-        const now = Date.now();
-        for (let i = 0; i < PROVIDERS_CHAIN.length; i++) {
-            if (this.quotaEpuise.get(i)) continue;
-            if ((this.rateLimitedUntil.get(i) ?? 0) > now) continue;
-            return i;
-        }
-        return -1; // tous épuisés
+    // Respecte le RPM sans log verbeux a chaque appel
+    private async respecterRpm(i: number): Promise<void> {
+        const config   = PROVIDERS_CHAIN[i];
+        const minDelay = Math.ceil((60 / config.rpm) * 1000 * 1.1); // 10% marge
+        const elapsed  = Date.now() - (this.lastCallTime.get(i) ?? 0);
+        if (elapsed < minDelay) await sleep(minDelay - elapsed);
+        this.lastCallTime.set(i, Date.now());
+    }
+
+    // Temps restant avant que ce provider soit disponible (0 = disponible maintenant)
+    private cooldownRestant(i: number): number {
+        return Math.max(0, (this.rateLimitedUntil.get(i) ?? 0) - Date.now());
+    }
+
+    // Plus court cooldown parmi les providers non-epuises
+    private prochainDisponibleDans(): number {
+        let min = Infinity;
+        PROVIDERS_CHAIN.forEach((_, i) => {
+            if (!this.quotaEpuise.get(i)) {
+                min = Math.min(min, this.cooldownRestant(i));
+            }
+        });
+        return min === Infinity ? -1 : min;
     }
 
     getCurrentProviderName(): string {
-        const i = this.premierDisponible();
-        return i >= 0 ? PROVIDERS_CHAIN[i].name : "Aucun";
+        for (let i = 0; i < PROVIDERS_CHAIN.length; i++) {
+            if (!this.quotaEpuise.get(i) && this.cooldownRestant(i) === 0) {
+                return PROVIDERS_CHAIN[i].name;
+            }
+        }
+        const dansMs = this.prochainDisponibleDans();
+        if (dansMs > 0) return `(cooldown ${Math.round(dansMs/1000)}s)`;
+        return "Aucun";
     }
 
-    // Réinitialise les rate limits (pas les quotas épuisés) pour un nouveau jour
-    resetRateLimits(): void {
-        this.rateLimitedUntil.forEach((_, i) => this.rateLimitedUntil.set(i, 0));
-        console.log("Rate limits réinitialisés.");
+    getEpuises(): string[] {
+        return PROVIDERS_CHAIN.filter((_, i) => this.quotaEpuise.get(i)).map(p => p.name);
     }
 
     async invoke(messages: BaseMessage[]): Promise<any> {
-        // Chercher le premier provider disponible — à chaque appel, pas en continu
-        let startIndex = this.premierDisponible();
+        // Log diagnostic
+        const epuises = this.getEpuises();
+        if (epuises.length > 0) console.log(`⚠️  Bannis session : ${epuises.join(", ")}`);
 
-        // Log de diagnostic : providers épuisés pour cette session
-        const epuises = PROVIDERS_CHAIN.filter((_, i) => this.quotaEpuise.get(i)).map(p => p.name);
-        if (epuises.length > 0) {
-            console.log(`⚠️  Providers bannis cette session : ${epuises.join(", ")}`);
-        }
+        // Verifier s'il reste au moins un provider non-epuise
+        const tousEpuises = PROVIDERS_CHAIN.every((_, i) => this.quotaEpuise.get(i));
+        if (tousEpuises) throw new Error("QUOTA_JOURNALIER_EPUISE");
 
-        if (startIndex < 0) {
-            throw new Error(
-                "Tous les providers LLM ont atteint leur quota journalier. " +
-                "Reessaie demain ou active la facturation sur une cle API."
-            );
-        }
+        // Deux passes :
+        //   Passe 1 : essayer tous les providers non-en-cooldown (sans dormir)
+        //   Passe 2 : attendre le cooldown le plus court, puis reessayer
+        // => Fini les 45s de sleep qui bloquent Groq pendant que Mistral refroidit
+        for (let passe = 0; passe < 2; passe++) {
+            let wasRateLimited = false;
+            let wasSkipped     = false;
 
-        // Flag : au moins un provider a été rate-limité pendant cet invoke
-        // Permet de distinguer "contexte cassé" (SKIP) de "providers saturés" (RATE_LIMIT)
-        let wasRateLimited = false;
+            for (let i = 0; i < PROVIDERS_CHAIN.length; i++) {
+                if (this.quotaEpuise.get(i)) continue;
 
-        // Essayer chaque provider disponible dans l'ordre
-        for (let i = startIndex; i < PROVIDERS_CHAIN.length; i++) {
-            if (this.quotaEpuise.get(i)) continue;
+                // Provider en cooldown => noter et passer au suivant SANS dormir
+                if (this.cooldownRestant(i) > 0) {
+                    wasRateLimited = true;
+                    continue;
+                }
 
-            const now = Date.now();
-            const cooldownUntil = this.rateLimitedUntil.get(i) ?? 0;
-            if (cooldownUntil > now) {
-                const wait = cooldownUntil - now;
-                console.log(`⏳ [${PROVIDERS_CHAIN[i].name}] en cooldown, attente ${Math.round(wait/1000)}s...`);
-                await sleep(wait);
-            }
+                const config = PROVIDERS_CHAIN[i];
+                const llm    = this.getInstance(i);
 
-            const config  = PROVIDERS_CHAIN[i];
-            const limiter = this.rateLimiters.get(i)!;
-            const llm     = this.getInstance(i);
+                for (let attempt = 0; attempt < config.maxRetries; attempt++) {
+                    try {
+                        await this.respecterRpm(i);
+                        console.log(`[${config.name}] tentative ${attempt + 1}/${config.maxRetries}`);
+                        const result = await llm.invoke(messages);
+                        this.rateLimitedUntil.set(i, 0); // succes => effacer cooldown
+                        return result;
 
-            for (let attempt = 0; attempt < config.maxRetries; attempt++) {
-                try {
-                    await limiter.wait();
-                    console.log(`[${config.name}] tentative ${attempt + 1}/${config.maxRetries}`);
-                    const result = await llm.invoke(messages);
-                    // Succès → retirer le cooldown éventuel
-                    this.rateLimitedUntil.set(i, 0);
-                    return result;
-                } catch (error: any) {
-                    const kind = classifierErreur(error);
-                    console.warn(`[${config.name}] ${kind} : ${String(error?.message).slice(0, 120)}`);
+                    } catch (error: any) {
+                        const kind = classifierErreur(error);
+                        console.warn(`[${config.name}] ${kind} : ${String(error?.message).slice(0, 120)}`);
 
-                    switch (kind) {
-                        case "QUOTA_EXHAUSTED":
-                            console.warn(`Quota epuise sur [${config.name}] → skip définitif pour cette session`);
-                            console.warn(`  Détail erreur : status=${error?.status ?? '?'} | ${String(error?.message).slice(0, 200)}`);
-                            this.quotaEpuise.set(i, true);
-                            attempt = config.maxRetries;
-                            break;
+                        switch (kind) {
+                            case "QUOTA_EXHAUSTED":
+                                console.warn(`  => Banni definitivement cette session`);
+                                this.quotaEpuise.set(i, true);
+                                attempt = config.maxRetries;
+                                break;
 
-                        case "SKIP":
-                            // Erreur de format pour CETTE requête
-                            console.warn(`[${config.name}] format incompatible pour cette requête → skip (provider conservé)`);
-                            attempt = config.maxRetries;
-                            break;
+                            case "SKIP":
+                                // Format incompatible pour CETTE requete, provider conserve
+                                wasSkipped = true;
+                                attempt = config.maxRetries;
+                                break;
 
-                        case "RATE_LIMIT": {
-                            // Extraire le délai suggéré par l'API (ex: "retry after 30s")
-                            const match    = error?.message?.match(/retry[^0-9]*(\d+(?:\.\d+)?)\s*s/i);
-                            const suggest  = match ? parseFloat(match[1]) * 1000 : 0;
-                            // Cooldown minimum basé sur le rpm du provider :
-                            const rpmCooldown = Math.ceil((60 / config.rpm) * 1000 * 3); // 3× la fenêtre RPM
-                            const expBackoff  = Math.pow(2, attempt + 2) * 1000; // 4s, 8s, 16s...
-                            const waitMs      = Math.max(suggest, rpmCooldown, expBackoff);
-                            console.warn(`Rate limit - attente ${Math.round(waitMs / 1000)}s... (rpm=${config.rpm}, suggest=${Math.round(suggest/1000)}s)`);
-                            this.rateLimitedUntil.set(i, Date.now() + waitMs);
-                            wasRateLimited = true;
-                            // Ne pas dormir ici : passer directement au provider suivant
-                            // Le cooldown sera respecté au prochain tour de boucle externe
-                            attempt = config.maxRetries; // forcer la sortie de la boucle inner
-                            break;
+                            case "RATE_LIMIT": {
+                                const match       = error?.message?.match(/retry[^0-9]*(\d+(?:\.\d+)?)\s*s/i);
+                                const suggest     = match ? parseFloat(match[1]) * 1000 : 0;
+                                const rpmCooldown = Math.ceil((60 / config.rpm) * 1000 * 3);
+                                const expBackoff  = Math.pow(2, attempt + 2) * 1000;
+                                const waitMs      = Math.max(suggest, rpmCooldown, expBackoff);
+                                console.warn(`  => Cooldown ${Math.round(waitMs / 1000)}s`);
+                                this.rateLimitedUntil.set(i, Date.now() + waitMs);
+                                wasRateLimited = true;
+                                attempt = config.maxRetries; // passer au provider suivant
+                                break;
+                            }
+
+                            case "RETRYABLE": {
+                                const waitMs = Math.pow(2, attempt + 1) * 1000;
+                                console.warn(`  => Retry dans ${Math.round(waitMs/1000)}s`);
+                                await sleep(waitMs);
+                                break;
+                            }
+
+                            case "FATAL":
+                                throw error;
                         }
-
-                        case "RETRYABLE": {
-                            const waitMs = Math.pow(2, attempt + 1) * 1000;
-                            console.warn(`Erreur temporaire - attente ${Math.round(waitMs / 1000)}s...`);
-                            await sleep(waitMs);
-                            break;
-                        }
-
-                        case "FATAL":
-                            throw error;
                     }
+                }
+
+                if (!this.quotaEpuise.get(i)) {
+                    console.log(`[${config.name}] retries epuises => provider suivant`);
                 }
             }
 
-            // Si on sort de la boucle de retries sans succès et sans exception fatale :
-            // c'est soit quota épuisé, soit rate limit dépassé → passer au suivant
-            if (!this.quotaEpuise.get(i)) {
-                console.log(`[${config.name}] retries épuisés → provider suivant`);
+            // Fin de passe sans succes
+            const tousEpuisesNow = PROVIDERS_CHAIN.every((_, i) => this.quotaEpuise.get(i));
+            if (tousEpuisesNow) throw new Error("QUOTA_JOURNALIER_EPUISE");
+
+            if (wasSkipped && !wasRateLimited) {
+                // Tous ont SKIPpe => contexte structurellement incompatible
+                throw new Error("CONTEXT_INCOMPATIBLE");
             }
-            const nextAvail = this.premierDisponible();
-            if (nextAvail > i) {
-                console.log(`Nouveau provider : ${PROVIDERS_CHAIN[nextAvail].name}`);
+
+            if (wasRateLimited && passe === 0) {
+                // Attendre le plus court cooldown, puis passe 2
+                const attente = this.prochainDisponibleDans();
+                if (attente > 0) {
+                    console.warn(`⏳ Tous en cooldown. Attente ${Math.round(attente/1000)}s...`);
+                    await sleep(attente + 300);
+                }
+                continue; // passe 2
             }
         }
 
-        let nbEpuises = 0;
-        this.quotaEpuise.forEach(v => { if (v) nbEpuises++; });
-        if (nbEpuises >= PROVIDERS_CHAIN.length) {
-            throw new Error(
-                "Tous les providers LLM ont atteint leur quota journalier. " +
-                "Reessaie demain ou active la facturation sur une cle API."
-            );
-        }
-
-        // wasRateLimited = au moins un provider a hit une rate limit → contexte potentiellement valide
-        // pas de wasRateLimited = tous ont SKIPpé → contexte structurellement cassé
-        if (wasRateLimited) {
-            const prochainDisponible = Math.min(
-                ...Array.from(this.rateLimitedUntil.entries())
-                    .filter(([i]) => !this.quotaEpuise.get(i))
-                    .map(([, until]) => Math.max(0, until - Date.now()))
-            );
-            console.warn(`⚠️  Tous les providers en rate-limit. Prochain dispo dans ~${Math.round(prochainDisponible/1000)}s`);
-            throw new Error("ALL_RATE_LIMITED");
-        }
-
-        // Aucun rate-limit, mais tous ont SKIPpé → contexte structurellement cassé
-        throw new Error("CONTEXT_INCOMPATIBLE");
+        throw new Error("ALL_RATE_LIMITED");
     }
 }
 
-// MIDDLEWARE D'OFFLOAD : INTERCEPTE LES RESULTATS D'OUTILS VOLUMINEUX
+// ─────────────────────────────────────────────────────────────────────────────
+// OFFLOAD MIDDLEWARE
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function toolNodeAvecOffload(
     etat: typeof EtatAgent.State,
@@ -492,13 +369,15 @@ async function toolNodeAvecOffload(
 ): Promise<{ messages: BaseMessage[] }> {
     const resultat = await toolNode.invoke(etat);
 
+    const outilsExclus = [
+        "screenshot_e2b", "obtenir_date", "calculer",
+        "grep_memoire", "lire_lignes", "resume_session",
+        "mettre_a_jour_todo", "lire_todo", "lire_instructions",
+    ];
+
     const messagesOptimises = resultat.messages.map((msg: BaseMessage) => {
         if (!(msg instanceof ToolMessage)) return msg;
         if (typeof msg.content !== "string") return msg;
-
-        const outilsExclus = ["screenshot_e2b", "obtenir_date", "calculer",
-                              "grep_memoire", "lire_lignes", "resume_session",
-                              "mettre_a_jour_todo", "lire_todo", "lire_instructions"];
         if (outilsExclus.some(nom => msg.name?.includes(nom))) return msg;
 
         const contenuOptimise = offloadSiVolumineux(msg.name ?? "tool", msg.content);
@@ -507,7 +386,7 @@ async function toolNodeAvecOffload(
             const ratio = Math.round(
                 ((msg.content.length - contenuOptimise.length) / msg.content.length) * 100
             );
-            console.log(`Offload FS : ${msg.name} | ${msg.content.length} -> ${contenuOptimise.length} chars (-${ratio}% tokens)`);
+            console.log(`Offload FS : ${msg.name} | ${msg.content.length} -> ${contenuOptimise.length} chars (-${ratio}%)`);
         }
 
         return new ToolMessage({
@@ -520,11 +399,12 @@ async function toolNodeAvecOffload(
     return { messages: messagesOptimises };
 }
 
-// INITIALISATION GLOBALE
+// ─────────────────────────────────────────────────────────────────────────────
+// INITIALISATION
+// ─────────────────────────────────────────────────────────────────────────────
 
 const TOUS_LES_TOOLS = [
     ...outilsDeBase,
-    /* ...browserTools, */
     ...e2bTools,
     ...credentialTools,
     ...debugTools,
@@ -534,10 +414,8 @@ const TOUS_LES_TOOLS = [
 const multiLLM = new MultiProviderLLM(TOUS_LES_TOOLS);
 
 const llmPourContexte = new ChatGoogleGenerativeAI({
-    model: "gemini-2.0-flash",
-    temperature: 0,
-    apiKey: process.env.GOOGLE_API_KEY,
-    maxRetries: 2,
+    model: "gemini-2.0-flash", temperature: 0,
+    apiKey: process.env.GOOGLE_API_KEY, maxRetries: 2,
 }) as any;
 
 const contextConfig: ContextConfig = {
@@ -550,7 +428,9 @@ export const contextManager = new AdvancedContextManager(contextConfig, llmPourC
 
 const memoireConversation = new InMemoryChatMessageHistory();
 
-// MEMOIRE EVOLUTIVE
+// ─────────────────────────────────────────────────────────────────────────────
+// SYSTEM PROMPT
+// ─────────────────────────────────────────────────────────────────────────────
 
 function chargerInstructionsMemoire(): string {
     try {
@@ -564,10 +444,6 @@ function chargerInstructionsMemoire(): string {
     }
 }
 
-// SYSTEM PROMPT
-// Règle KV cache : préfixe STABLE identique à chaque appel → pleinement caché.
-// Contenu dynamique (instructions apprises) injecté À LA FIN uniquement.
-
 const SYSTEME_PROMPT_BASE = `Tu es un expert IA autonome. Tu disposes des outils suivants pour interagir avec le monde exterieur. Reponds toujours en francais.
 
 OUTILS DISPONIBLES :
@@ -578,15 +454,13 @@ Navigation (E2B Sandbox) :
   - appuyer_touche_e2b     : appuie sur Enter/Tab/Escape pour valider un formulaire
   - selectionner_option_e2b : choisit une option dans un menu deroulant <select>
   - evaluer_js_e2b          : execute du JavaScript sur la page (lecture/ecriture DOM)
+  - lister_champs_formulaire : liste tous les inputs/selects/boutons de la page
 
 Fichiers de base :
   - calculer, lire_fichier, ecrire_fichier, lister_fichiers, obtenir_date
 
 Credentials :
   - sauvegarder_credential, lire_credential, generate_mot_de_passe
-
-Debug :
-  - diagnostic_navigateur, tester_selecteur
 
 FS-Memory (PRIORITAIRE pour les grands resultats) :
   - grep_memoire, lire_lignes, rechercher_glob, ecrire_decouverte
@@ -605,12 +479,10 @@ WORKFLOW CREATION DE COMPTE (a suivre dans CET ORDRE) :
 3. aller_vers_e2b vers la page d'inscription
 4. screenshot_e2b pour voir la page
 5. OBLIGATOIRE : appelle lire_page_e2b AVEC format="html" pour obtenir le code HTML complet.
-   - Si le résultat est trop volumineux, il sera sauvegardé et tu recevras un chemin.
-   - Utilise immédiatement grep_memoire ou evaluer_js_e2b pour extraire les sélecteurs.
-   - NE PAS continuer sans avoir analysé la structure de la page.
-6. SI grep_memoire ne trouve rien, utilise evaluer_js_e2b avec le script suivant :
-   Array.from(document.querySelectorAll('input, select, textarea, button'))
-       .map(el => ({ tag: el.tagName, name: el.name, id: el.id, type: el.type }))
+   - Si le resultat est trop volumineux, il sera sauvegarde et tu recevras un chemin.
+   - Utilise immediatement grep_memoire ou evaluer_js_e2b pour extraire les selecteurs.
+   - NE PAS continuer sans avoir analyse la structure de la page.
+6. SI grep_memoire ne trouve rien, utilise lister_champs_formulaire
 7. Cocher les cases : cocher_case_e2b
 8. Menus deroulants : selectionner_option_e2b
 9. Valider : cliquer_e2b sur le bouton OU appuyer_touche_e2b "Enter"
@@ -625,11 +497,11 @@ REGLES D'OR :
 4. Apres une creation de compte, sauvegarde TOUJOURS les identifiants avec sauvegarder_credential.
 5. Si un selecteur echoue, essaie dans l'ordre :
    a. lire_page_e2b (html) pour voir la structure reelle
-   b. evaluer_js_e2b pour lister les inputs : Array.from(document.querySelectorAll('input')).map(e=>e.name+':'+e.id)
-   c. tester_selecteur pour verifier qu'un element existe
+   b. lister_champs_formulaire pour lister les inputs
+   c. evaluer_js_e2b pour lister les inputs manuellement
 6. Si l'utilisateur te donne un conseil, utilise apprendre_instruction.
 7. SCREENSHOT OBLIGATOIRE apres chaque navigation, clic et saisie.
-   NE JAMAIS repondre "j'ai effectue l'action" sans screenshot_e2b juste avant.
+   NE JAMAIS repondre j ai effectue l action sans screenshot_e2b juste avant.
 8. Utilise attendre_e2b (ms: 1500) apres chaque soumission de formulaire.
 
 SELECTEURS COURANTS :
@@ -643,110 +515,62 @@ function construireSystemePrompt(): string {
     return SYSTEME_PROMPT_BASE + chargerInstructionsMemoire();
 }
 
-
 // ─────────────────────────────────────────────────────────────────────────────
-// SANITISATION DES MESSAGES POUR PROVIDERS STRICTS (Mistral)
-//
-// Mistral exige :
-//   1. Pour chaque tool_call dans un AIMessage, UN ToolMessage correspondant
-//   2. Pas d'AIMessage entre les ToolMessages d'un même AIMessage
-//   3. Dernier message = HumanMessage ou ToolMessage (jamais AIMessage)
-//
-// Architecture : traitement PAR PAIRES ATOMIQUES (AIMessage + ses ToolMessages)
-//   → élimine la cascade d'orphelins des anciennes passes séquentielles P0→P4
+// SANITISATION DES MESSAGES
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Extrait tous les tool_calls d'un AIMessage (LangChain + additional_kwargs) */
 function extraireToolCalls(msg: AIMessage): Array<{ id: string; name: string; args: any }> {
-    // Source 1 : msg.tool_calls (format LangChain canonique)
     const lcCalls = (msg.tool_calls ?? []).filter((tc: any) => !!tc.id);
-
     if (lcCalls.length > 0) {
-        return lcCalls.map((tc: any) => ({
-            id  : tc.id as string,
-            name: tc.name,
-            args: tc.args,
-        }));
+        return lcCalls.map((tc: any) => ({ id: tc.id as string, name: tc.name, args: tc.args }));
     }
-
-    // Source 2 : additional_kwargs.tool_calls (format brut provider)
     const akCalls = (msg.additional_kwargs?.tool_calls as any[]) ?? [];
-    return akCalls
-        .filter((tc: any) => !!tc.id)
-        .map((tc: any) => ({
-            id  : tc.id as string,
-            name: tc.function?.name ?? tc.name ?? "unknown",
-            args: (() => {
-                try { return JSON.parse(tc.function?.arguments ?? tc.arguments ?? "{}"); }
-                catch { return {}; }
-            })(),
-        }));
+    return akCalls.filter((tc: any) => !!tc.id).map((tc: any) => ({
+        id  : tc.id as string,
+        name: tc.function?.name ?? tc.name ?? "unknown",
+        args: (() => {
+            try { return JSON.parse(tc.function?.arguments ?? tc.arguments ?? "{}"); }
+            catch { return {}; }
+        })(),
+    }));
 }
 
-/** Reconstruit un AIMessage normalisé (additional_kwargs en format OpenAI standard) */
 function normaliserAIMessage(msg: AIMessage, toolCalls: Array<{ id: string; name: string; args: any }>): AIMessage {
     const akNormalisé = toolCalls.map(tc => ({
-        id      : tc.id,
-        type    : "function" as const,
+        id: tc.id, type: "function" as const,
         function: {
-            name     : tc.name,
+            name: tc.name,
             arguments: typeof tc.args === "string" ? tc.args : JSON.stringify(tc.args ?? {}),
         },
     }));
-    const lcCalls = toolCalls.map(tc => ({
-        id  : tc.id,
-        name: tc.name,
-        args: tc.args,
-        type: "tool_call" as const,
-    }));
     return new AIMessage({
-        content          : msg.content,
-        tool_calls       : lcCalls,
+        content: msg.content,
+        tool_calls: toolCalls.map(tc => ({ id: tc.id, name: tc.name, args: tc.args, type: "tool_call" as const })),
         additional_kwargs: { ...msg.additional_kwargs, tool_calls: akNormalisé },
     });
 }
 
 function sanitiserMessages(messages: BaseMessage[]): BaseMessage[] {
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // PHASE 1 : Traitement atomique — parcours linéaire, message par message.
-    //
-    // Règle fondamentale : un AIMessage avec tool_calls doit être suivi de
-    // EXACTEMENT N ToolMessages, un par tool_call_id (pas moins, pas plus).
-    //
-    // Chaque (AIMessage + ToolMessages[]) est traité comme une UNITÉ ATOMIQUE :
-    //   - Si la paire est incomplète ou incohérente → TOUTE l'unité est rejetée
-    //   - Si la paire est complète → normalisée et conservée
-    //
-    // Les ToolMessages sans parent AIMessage-avec-tools (orphelins) sont supprimés.
-    // ═══════════════════════════════════════════════════════════════════════
-
     const resultat: BaseMessage[] = [];
     let i = 0;
 
     while (i < messages.length) {
         const msg = messages[i];
 
-        // ── Cas 1 : AIMessage ───────────────────────────────────────────────
         if (msg instanceof AIMessage) {
             const toolCalls = extraireToolCalls(msg);
             const content   = String(msg.content ?? "").trim();
 
-            // 1a. AIMessage vide (ni texte ni tools) → supprimer
             if (!content && toolCalls.length === 0) {
-                console.warn(`⚠️  Sanitise : AIMessage vide supprimé`);
-                i++;
-                continue;
+                console.warn(`Sanitise : AIMessage vide supprime`);
+                i++; continue;
             }
 
-            // 1b. AIMessage sans tool_calls → garder tel quel
             if (toolCalls.length === 0) {
-                resultat.push(msg);
-                i++;
-                continue;
+                resultat.push(msg); i++; continue;
             }
 
-            // 1c. AIMessage avec tool_calls → collecter les ToolMessages suivants
+            // Collecter les ToolMessages suivants
             const toolMsgsSuivants: ToolMessage[] = [];
             let j = i + 1;
             while (j < messages.length && messages[j] instanceof ToolMessage) {
@@ -754,97 +578,97 @@ function sanitiserMessages(messages: BaseMessage[]): BaseMessage[] {
                 j++;
             }
 
-            // Vérifier que chaque tool_call_id est couvert par exactement un ToolMessage
-            const idsAttendus  = new Set(toolCalls.map(tc => tc.id));
-            const idsReçus     = new Set(toolMsgsSuivants.map(tm => tm.tool_call_id).filter(Boolean));
-            const paireValide  =
-                idsAttendus.size === idsReçus.size &&
+            const idsAttendus = new Set(toolCalls.map(tc => tc.id));
+            const idsRecus    = new Set(toolMsgsSuivants.map(tm => tm.tool_call_id).filter(Boolean));
+            const paireValide =
+                idsAttendus.size === idsRecus.size &&
                 idsAttendus.size > 0 &&
-                [...idsAttendus].every(id => idsReçus.has(id));
+                [...idsAttendus].every(id => idsRecus.has(id));
 
             if (paireValide) {
-                // Normaliser l'AIMessage et garder les ToolMessages correspondants
                 resultat.push(normaliserAIMessage(msg, toolCalls));
-                // Garder uniquement les ToolMessages dans l'ordre des tool_calls
                 for (const tc of toolCalls) {
-                    const tm = toolMsgsSuivants.find(t => t.tool_call_id === tc.id)!;
-                    resultat.push(tm);
+                    resultat.push(toolMsgsSuivants.find(t => t.tool_call_id === tc.id)!);
                 }
                 i = j;
             } else {
-                // Paire incomplète ou incohérente → rejeter toute l'unité atomique
-                console.warn(
-                    `⚠️  Sanitise : Paire rejetée — ${idsAttendus.size} tool_call(s) ` +
-                    `attendu(s), ${idsReçus.size} ToolMessage(s) reçu(s). ` +
-                    `Ids attendus: [${[...idsAttendus].join(", ")}]`
-                );
-                i = j; // sauter aussi les ToolMessages suivants
+                console.warn(`Sanitise : Paire incomplete rejetee (${idsAttendus.size} attendus, ${idsRecus.size} recus)`);
+                i = j;
             }
             continue;
         }
 
-        // ── Cas 2 : ToolMessage non précédé d'un AIMessage-avec-tools (orphelin) ──
         if (msg instanceof ToolMessage) {
-            // Vérifier si le dernier message dans resultat est bien son parent
             const prev = resultat.at(-1);
             const prevEstParent = prev instanceof AIMessage && (
                 (prev.tool_calls?.some((tc: any) => tc.id === msg.tool_call_id)) ||
-                ((prev.additional_kwargs?.tool_calls as any[])?.some(
-                    (tc: any) => tc.id === msg.tool_call_id
-                ))
+                ((prev.additional_kwargs?.tool_calls as any[])?.some((tc: any) => tc.id === msg.tool_call_id))
             );
             if (!prevEstParent) {
-                // Ce ToolMessage a été produit hors de notre parcours → orphelin résiduel
-                // (peut arriver si des messages du contextManager se mélangent à etat.messages)
-                console.warn(`⚠️  Sanitise P1 : ToolMessage orphelin ignoré (id: ${msg.tool_call_id ?? "undefined"})`);
-                i++;
-                continue;
+                console.warn(`Sanitise : ToolMessage orphelin supprime (id: ${msg.tool_call_id})`);
+                i++; continue;
             }
-            // Normalement les ToolMessages sont ajoutés dans le Cas 1c, pas ici
-            // Si on arrive ici c'est un cas rare → garder par prudence
-            resultat.push(msg);
-            i++;
-            continue;
+            resultat.push(msg); i++; continue;
         }
 
-        // ── Cas 3 : HumanMessage ou autre → garder tel quel ─────────────────
-        resultat.push(msg);
-        i++;
+        resultat.push(msg); i++;
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // PHASE 2 : Contraintes de format pour Mistral (dernier message)
-    // ═══════════════════════════════════════════════════════════════════════
-
-    // Supprimer les AIMessages terminaux avec tool_calls (aucune réponse d'outil)
+    // Supprimer les AIMessages terminaux avec tool_calls sans reponse
     while (resultat.length > 0) {
         const last = resultat.at(-1)!;
         if (last instanceof AIMessage && (last.tool_calls?.length ?? 0) > 0) {
-            console.warn(`⚠️  Sanitise : AIMessage terminal avec tool_calls supprimé`);
+            console.warn(`Sanitise : AIMessage terminal avec tool_calls supprime`);
             resultat.pop();
-        } else {
-            break;
-        }
+        } else break;
     }
 
-    // Mistral refuse si le dernier message est un AIMessage (sans tool_calls)
+    // Mistral refuse si le dernier message est un AIMessage sans tool_calls
     const dernierMsg = resultat.at(-1);
     if (dernierMsg instanceof AIMessage) {
         const txt = String(dernierMsg.content ?? "").trim();
         if (!txt) {
             resultat.pop();
-            console.warn(`⚠️  Sanitise : AIMessage vide terminal supprimé`);
         } else {
-            resultat.push(new HumanMessage("[RELANCE SYSTÈME] Reprends la tâche là où tu t'es arrêté."));
-            console.warn(`⚠️  Sanitise : HumanMessage de relance ajouté (contexte terminait sur AIMessage)`);
+            resultat.push(new HumanMessage("[RELANCE SYSTEME] Reprends la tache la ou tu t'es arrete."));
         }
     }
 
     return resultat;
 }
 
-// GRAPHE LANGGRAPH
+// ─────────────────────────────────────────────────────────────────────────────
+// NORMALISATION DES IDS (Gemini omet les IDs de tool_calls)
+// ─────────────────────────────────────────────────────────────────────────────
 
+function normaliserToolCallIds(msg: any): any {
+    const toolCalls = msg.tool_calls ?? [];
+    if (toolCalls.length === 0) return msg;
+
+    const fixed = toolCalls.map((tc: any) => {
+        if (tc.id) return tc;
+        const id = Math.random().toString(36).slice(2, 11);
+        console.warn(`tool_call "${tc.name}" sans id => id="${id}" assigne`);
+        return { ...tc, id };
+    });
+
+    const akNormalisé = fixed.map((tc: any) => ({
+        id: tc.id, type: "function" as const,
+        function: {
+            name: tc.name,
+            arguments: typeof tc.args === "string" ? tc.args : JSON.stringify(tc.args ?? {}),
+        },
+    }));
+
+    return new AIMessage({
+        content: msg.content, tool_calls: fixed,
+        additional_kwargs: { ...msg.additional_kwargs, tool_calls: akNormalisé },
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GRAPHE LANGGRAPH
+// ─────────────────────────────────────────────────────────────────────────────
 
 const EtatAgent = Annotation.Root({
     messages: Annotation<BaseMessage[]>({
@@ -855,44 +679,6 @@ const EtatAgent = Annotation.Root({
 
 const toolNodeBase = new ToolNode(TOUS_LES_TOOLS);
 
-// ─────────────────────────────────────────────────────────────────────────────
-// NORMALISATION DES IDS — intercepte la réponse LLM AVANT qu'elle entre
-// dans etat.messages. Gemini génère des tool_calls sans id → les ToolMessages
-// créés par LangGraph héritent de tool_call_id=undefined → orphelins permanents.
-// Ce fix assigne un id AVANT que le mal soit fait.
-// ─────────────────────────────────────────────────────────────────────────────
-function normaliserToolCallIds(msg: any): any {
-    const toolCalls = msg.tool_calls ?? [];
-    if (toolCalls.length === 0) return msg;
-    if (toolCalls.every((tc: any) => !!tc.id)) {
-        // Ids OK — reconstruire quand même additional_kwargs en format OpenAI
-        // (Groq/Mistral lisent additional_kwargs, pas msg.tool_calls)
-        const akNormalisé = toolCalls.map((tc: any) => ({
-            id: tc.id, type: "function" as const,
-            function: { name: tc.name, arguments: typeof tc.args === "string" ? tc.args : JSON.stringify(tc.args ?? {}) },
-        }));
-        return new AIMessage({
-            content: msg.content, tool_calls: toolCalls,
-            additional_kwargs: { ...msg.additional_kwargs, tool_calls: akNormalisé },
-        });
-    }
-    // Ids manquants → en assigner
-    const fixed = toolCalls.map((tc: any) => {
-        if (tc.id) return tc;
-        const id = Math.random().toString(36).slice(2, 11);
-        console.warn(`🔧 tool_call "${tc.name}" sans id → id="${id}" assigné`);
-        return { ...tc, id };
-    });
-    const akNormalisé = fixed.map((tc: any) => ({
-        id: tc.id, type: "function" as const,
-        function: { name: tc.name, arguments: typeof tc.args === "string" ? tc.args : JSON.stringify(tc.args ?? {}) },
-    }));
-    return new AIMessage({
-        content: msg.content, tool_calls: fixed,
-        additional_kwargs: { ...msg.additional_kwargs, tool_calls: akNormalisé },
-    });
-}
-
 async function noeudLLM(etat: typeof EtatAgent.State) {
     console.log(`noeudLLM - ${etat.messages.length} msgs | Provider : ${multiLLM.getCurrentProviderName()}`);
 
@@ -902,68 +688,46 @@ async function noeudLLM(etat: typeof EtatAgent.State) {
     }
 
     try {
-        const SYSTEME_PROMPT = construireSystemePrompt();
+        const SYSTEME_PROMPT   = construireSystemePrompt();
         const optimizedContext = await contextManager.getOptimizedContext(SYSTEME_PROMPT);
-        const allMessages      = [...optimizedContext, ...etat.messages];
 
         const stats = contextManager.getContextStats();
-        console.log(
-            `Contexte : ${stats.totalMessages} msgs | ` +
-            `${stats.currentTokens} tokens | ` +
-            `compression : ${((1 - stats.compressionRatio) * 100).toFixed(0)}%`
-        );
+        console.log(`Contexte : ${stats.totalMessages} msgs | ${stats.currentTokens} tokens | compression : ${((1 - stats.compressionRatio) * 100).toFixed(0)}%`);
 
-        // ── Fenêtre glissante ──────────────────────────────────────────────────
-        // etat.messages accumule TOUT depuis le début (reducer append-only).
-        // Le contextManager gère déjà l'historique global.
-        // On ne passe que les 12 derniers messages pour éviter l'accumulation
-        // de paires AIMessage/ToolMessage de providers différents → orphelins.
-        const MAX_RECENT = 12;
+        // Fenetre glissante : 6 derniers messages seulement
+        // Groq llama-3.1-8b fait du 413 au-dela de ~4000 tokens dans messages[]
+        const MAX_RECENT = 6;
         const recent = etat.messages.length > MAX_RECENT
             ? etat.messages.slice(-MAX_RECENT)
             : etat.messages;
-        // Ne jamais démarrer sur :
-        //   - un AIMessage sans tool_calls (son HumanMessage parent est hors fenêtre)
-        //   - un ToolMessage (son AIMessage parent est hors fenêtre → orphelin immédiat)
-        // Avancer jusqu'au premier HumanMessage ou AIMessage-avec-tools.
+
+        // Ne pas demarrer sur un ToolMessage ou AIMessage-sans-tools (orphelins potentiels)
         let debut = 0;
         while (debut < recent.length - 1) {
             const m = recent[debut];
             const isAISansTools = m instanceof AIMessage && (m.tool_calls?.length ?? 0) === 0;
-            const isToolMsg     = m instanceof ToolMessage;
-            if (isAISansTools || isToolMsg) { debut++; } else { break; }
+            if (isAISansTools || m instanceof ToolMessage) { debut++; } else break;
         }
-        const allMessagesFenetre = [...optimizedContext, ...recent.slice(debut)];
-        // ────────────────────────────────────────────────────────────────────
 
-        const messagesSanitises = sanitiserMessages(allMessagesFenetre);
+        const messagesFenetre   = [...optimizedContext, ...recent.slice(debut)];
+        const messagesSanitises = sanitiserMessages(messagesFenetre);
         const reponse = await multiLLM.invoke(messagesSanitises);
         console.log("Reponse LLM recue.");
 
-        // Détection réponse vide : pas de texte ET pas de tool calls
-        // Cause : Gemini 2.5 Flash peut retourner un message vide si le contexte
-        // contient des messages d'une session précédente qui le perturbent.
-        // Solution : relancer avec un message de nudge qui force l'action.
-        const texte = String(reponse.content ?? "").trim();
-        const aDesTools =
-            (reponse.tool_calls?.length > 0) ||
-            (reponse.additional_kwargs?.tool_calls?.length > 0);
+        // Reponse vide => nudge
+        const texte     = String(reponse.content ?? "").trim();
+        const aDesTools = (reponse.tool_calls?.length > 0) || (reponse.additional_kwargs?.tool_calls?.length > 0);
 
         if (!texte && !aDesTools) {
-            console.warn("⚠️  Réponse vide détectée — relance avec nudge...");
-            // NE PAS inclure `reponse` (AIMessage vide) dans le contexte :
-            // Mistral rejette tout AIMessage sans content ni tool_calls (code 400).
-            // On injecte directement un HumanMessage de relance.
+            console.warn("Reponse vide detectee => nudge...");
             const messagesAvecNudge = [
-                ...allMessagesFenetre,
+                ...messagesFenetre,
                 new HumanMessage(
-                    "[RELANCE] Ta réponse précédente était vide. " +
-                    "Tu dois OBLIGATOIREMENT utiliser les outils disponibles. " +
-                    "Commence maintenant par l'action la plus logique."
+                    "[RELANCE] Ta reponse etait vide. Tu DOIS utiliser un outil maintenant. " +
+                    "Commence par l'action la plus logique."
                 ),
             ];
             const reponseNudge = await multiLLM.invoke(sanitiserMessages(messagesAvecNudge));
-            console.log("Réponse après nudge reçue.");
             return { messages: [normaliserToolCallIds(reponseNudge)] };
         }
 
@@ -972,72 +736,44 @@ async function noeudLLM(etat: typeof EtatAgent.State) {
     } catch (error: any) {
         console.error("Erreur definitive noeudLLM:", error?.message);
 
-        // Contexte cassé (SKIP de tous les providers) OU tous rate-limités temporairement
-        // → fallback nucléaire : clearContext + reset rate limits + relance message brut
-        const estRecuperable =
-            error?.message === "CONTEXT_INCOMPATIBLE" ||
-            error?.message === "ALL_RATE_LIMITED";
+        const estRecuperable = ["CONTEXT_INCOMPATIBLE", "ALL_RATE_LIMITED"].includes(error?.message);
 
         if (estRecuperable) {
-            const raisonFallback = error?.message === "ALL_RATE_LIMITED"
-                ? "Tous les providers en rate-limit → reset cooldowns"
-                : "Contexte incompatible → reset complet";
-            console.warn(`⚠️  FALLBACK NUCLÉAIRE : ${raisonFallback}`);
+            // FALLBACK NUCLEAIRE
+            // On N'efface PAS les rate limits (evite les re-429 immediats)
+            // On efface le contexte et invoke() gerera lui-meme les cooldowns
+            console.warn(`FALLBACK NUCLEAIRE (${error.message}) => reset contexte + reinvocation`);
 
             const dernierHuman = etat.messages.filter(m => m instanceof HumanMessage).at(-1);
             if (dernierHuman) {
+                await contextManager.clearContext();
+                console.log("Contexte efface.");
+
+                const systemPrompt    = construireSystemePrompt();
+                const messagesFallback = [
+                    new HumanMessage(systemPrompt + "\n\n---\n\nTache : " + String(dernierHuman.content))
+                ];
+
                 try {
-                    await contextManager.clearContext();   // Vider l'historique cassé
-                    multiLLM.resetRateLimits();            // ← CRITIQUE : débloquer les cooldowns
-                    console.warn("🔄 Rate limits réinitialisés, relance avec message brut...");
-                    const reponseNucleaire = await multiLLM.invoke([
-                        new HumanMessage(
-                            "Tu es un agent IA autonome. Réponds en français. " +
-                            "Message : " + String(dernierHuman.content)
-                        )
-                    ]);
-                    console.log("Réponse fallback nucléaire reçue.");
-                    return { messages: [normaliserToolCallIds(reponseNucleaire)] };
+                    const reponse = await multiLLM.invoke(messagesFallback);
+                    console.log("Reponse fallback recue.");
+                    return { messages: [normaliserToolCallIds(reponse)] };
                 } catch (e2: any) {
-                    console.error("Fallback nucléaire échoué:", e2?.message);
-                    // Tous les providers sont saturés ou le contexte est toujours cassé
-                    // → attendre 30s puis retenter UNE dernière fois avant de rendre la main
-                    if (
-                        e2?.message === "ALL_RATE_LIMITED" ||
-                        e2?.message === "CONTEXT_INCOMPATIBLE"
-                    ) {
-                        console.warn("⏳ Attente 30s avant dernier essai...");
-                        await sleep(30000);
-                        multiLLM.resetRateLimits();
-                        try {
-                            const reponseFinale = await multiLLM.invoke([
-                                new HumanMessage(
-                                    "Tu es un agent IA autonome. Réponds en français. " +
-                                    "Message : " + String(dernierHuman.content)
-                                )
-                            ]);
-                            console.log("Réponse dernier essai reçue.");
-                            return { messages: [normaliserToolCallIds(reponseFinale)] };
-                        } catch {
-                            return { messages: [new AIMessage(
-                                "⏳ Tous les providers LLM sont temporairement saturés. " +
-                                "Attends 1 à 2 minutes puis réessaie."
-                            )] };
-                        }
-                    }
+                    console.error("Fallback echoue:", e2?.message);
+                    // invoke() a deja gere les 2 passes et attendu les cooldowns
+                    // Si ca echoue encore = vraiment tout est epuise/sature
                 }
             }
         }
 
-        const isQuotaEpuise = error?.message?.includes("Tous les providers");
-        const isRateLimit   = error?.message === "ALL_RATE_LIMITED" || error?.message === "CONTEXT_INCOMPATIBLE";
-        const messageErreur = isQuotaEpuise
-            ? "ERREUR QUOTA : Tous les providers LLM sont epuises. Attendre demain."
-            : isRateLimit
-            ? "⏳ Tous les providers LLM sont temporairement saturés. Attends 1 à 2 minutes puis réessaie."
-            : `ERREUR TECHNIQUE [${error?.constructor?.name ?? "Error"}]: ${error?.message ?? "inconnue"}\n` +
-              `Stack: ${(error?.stack ?? "").split("\n").slice(0, 3).join(" | ")}`;
-        return { messages: [new AIMessage(messageErreur)] };
+        // Message final lisible
+        if (error?.message === "QUOTA_JOURNALIER_EPUISE" || error?.message?.includes("Tous les providers")) {
+            return { messages: [new AIMessage("Quota journalier epuise sur tous les providers. Reessaie demain.")] };
+        }
+        if (estRecuperable) {
+            return { messages: [new AIMessage("Tous les providers sont en cooldown. Attends 1-2 minutes et reessaie.")] };
+        }
+        return { messages: [new AIMessage(`Erreur technique : ${error?.message ?? "inconnue"}`)] };
     }
 }
 
@@ -1051,18 +787,10 @@ function decider(etat: typeof EtatAgent.State): string {
     const hasToolCalls =
         (dernierMessage?.tool_calls && dernierMessage.tool_calls.length > 0) ||
         (dernierMessage?.additional_kwargs?.tool_calls &&
-            (dernierMessage.additional_kwargs.tool_calls as any[]).length > 0) ||
-        ((dernierMessage as any)?.kwargs?.tool_calls &&
-            (dernierMessage as any).kwargs.tool_calls.length > 0);
+            (dernierMessage.additional_kwargs.tool_calls as any[]).length > 0);
 
     if (hasToolCalls) { console.log("decider -> tools"); return "tools"; }
-
-    const texte = String(dernierMessage?.content ?? "").trim();
-    if (!texte) {
-        console.warn("⚠️  decider -> END (réponse vide, nudge non résolu)");
-    } else {
-        console.log("decider -> END");
-    }
+    console.log("decider -> END");
     return END;
 }
 
@@ -1073,9 +801,11 @@ const graphe = new StateGraph(EtatAgent)
     .addConditionalEdges("llm", decider)
     .addEdge("tools", "llm")
     .compile()
-    .withConfig({ recursionLimit: 100 });
+    .withConfig({ recursionLimit: 25 });
 
+// ─────────────────────────────────────────────────────────────────────────────
 // API PUBLIQUE
+// ─────────────────────────────────────────────────────────────────────────────
 
 export interface AgentResponse {
     text: string;
@@ -1084,30 +814,20 @@ export interface AgentResponse {
 
 export async function traiterMessage(messageUtilisateur: string): Promise<AgentResponse> {
     try {
-        // ── Détection de demande de screenshot explicite ──────────────────────
-        // Si l'utilisateur demande une capture, on injecte un rappel fort dans
-        // le message pour contourner les LLMs (ex: Mistral small) qui ignorent
-        // les consignes implicites du system prompt.
         const motsClesCapture = /capture|screenshot|photo|image|montre|affiche|vois|voir la page/i;
-        const demandeCapture = motsClesCapture.test(messageUtilisateur);
-        const messageInjecte = demandeCapture
-            ? `${messageUtilisateur}\n[INSTRUCTION CRITIQUE : Tu DOIS appeler screenshot_e2b maintenant. C'est obligatoire.]`
+        const messageInjecte = motsClesCapture.test(messageUtilisateur)
+            ? `${messageUtilisateur}\n[INSTRUCTION CRITIQUE : Tu DOIS appeler screenshot_e2b maintenant.]`
             : messageUtilisateur;
 
-        const messageEntrant = new HumanMessage(messageInjecte);
-        await contextManager.addMessage(new HumanMessage(messageUtilisateur)); // contexte sans injection
+        await contextManager.addMessage(new HumanMessage(messageUtilisateur));
 
-        const resultat = await graphe.invoke(
-            { messages: [messageEntrant] }
-        );
+        const resultat = await graphe.invoke({ messages: [new HumanMessage(messageInjecte)] });
 
         let screenshotData: string | undefined;
         for (const msg of resultat.messages) {
-            if (
-                msg instanceof ToolMessage &&
+            if (msg instanceof ToolMessage &&
                 typeof msg.content === "string" &&
-                msg.content.startsWith("data:image")
-            ) {
+                msg.content.startsWith("data:image")) {
                 screenshotData = msg.content;
             }
         }
@@ -1127,17 +847,17 @@ export async function traiterMessage(messageUtilisateur: string): Promise<AgentR
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
 // INTERFACE CLI
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function demarrerInterface() {
     console.log("\n" + "=".repeat(65));
     console.log(" AGENT IA AUTONOME - LangChain + LangGraph + FS-Memory ");
     console.log("=".repeat(65));
-    console.log("Providers (fallback automatique) :");
     PROVIDERS_CHAIN.forEach((p, i) =>
         console.log(`  ${i + 1}. ${p.name.padEnd(26)} ${p.rpm} req/min`)
     );
-    console.log("FS-Memory : ./agent-memory/ (offload auto des gros resultats)");
     console.log("-".repeat(65));
     console.log("  'exit' -> Quitter | 'reset' -> Memoire | 'tools' -> Liste");
     console.log("=".repeat(65) + "\n");
@@ -1162,11 +882,9 @@ async function demarrerInterface() {
                 LireQuestion(); return;
             }
             if (msg.toLowerCase() === "tools") {
-                console.log("\n Tools disponibles :");
                 TOUS_LES_TOOLS.forEach(t =>
                     console.log(`  - ${t.name}: ${t.description.slice(0, 70)}...`)
                 );
-                console.log();
                 LireQuestion(); return;
             }
 
